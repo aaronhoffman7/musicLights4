@@ -1,6 +1,6 @@
 import serial
+from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtWidgets, QtCore
 import numpy as np
 
 # === CONFIG ===

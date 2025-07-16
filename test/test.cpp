@@ -7,9 +7,7 @@ void updateDynamicMaxBand();
 void cyclePalettes();
 void printBandsForPlotter();
 void updateDynamicMaxTreble();
-void updatePaletteBlend();
-void updateBassBrightnessOverlay();
-
+CRGBPalette16 blendPalettes(const CRGBPalette16& from, const CRGBPalette16& to, uint8_t amount);
 
 // === Constants and Globals ===  
 #define STROBE_PIN 12
@@ -28,14 +26,15 @@ void updateBassBrightnessOverlay();
 #define FLASH_DURATION 300         // milliseconds
 
 //music variables
-const int noiseFloor = 50;
+const int noiseFloor = 45;
 int maxTrebleValue = 0;  // variable
-int maxTrebleValue2 = 750; //start value (decays from here)
+int maxTrebleValue2 = 650; //start value (decays from here)
 unsigned long lastTrebleTrigger = 0;
 unsigned long lastBassHit = 0;
 const int paletteCycleDuration = 10000;
+const int trebleBand = 4;
 int selectedBand1 = 1; // LED strip 1 (bass)
-int selectedBand2 = 5; // LED strip 2 (bass)
+int selectedBand2 = 4; // LED strip 2 (bass)
 
 const int maxBassBrightness = 130;   // Higher maximum for bass hits
 const int maxTrebleBrightness = 220; // Higher maximum for treble hits
@@ -52,7 +51,7 @@ const int bassDeltaThreshold = 50;  // min gap between bass triggers (ms)
 const int trebleDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
 const int trebleDecayRaw = 1; // x / 1023
 const int bassDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
-const int bassDecayRaw = 1; // x / 1023
+const int bassDecayRaw = 3; // x / 1023
 int maxBandValue = 0; // max bass
 float maxBandValue2 = 800;  // Upper clamp for bass band value
 int burstLength = 4;            // number of LEDs to light up (1 on either side of center)
@@ -60,20 +59,17 @@ CRGB trebleBursts[NUM_LEDS];     // stores active burst overlays
 int trebleBurstPos = 0;      // Current position of treble burst center
 int trebleBurstDir = 1;      // +1 = right, -1 = left (bouncing direction)
 const int bassSegmentJump = 2;
-uint8_t bassBrightnessOverlay[NUM_LEDS] = {0};
 
 
 uint8_t currentBassBrightness = baseBrightness;
 uint8_t targetBassBrightness = baseBrightness;
 unsigned long bassFadeStart = 0;
-const unsigned long bassFadeDuration = 800;  // Fade back to base in 2.5 sec
+const unsigned long bassFadeDuration = 550;  // Fade back to base in 2.5 sec
 static int bassLitStart = 0;
 static int bassLitLength = 10;
 static int bassMoveDir = 1; // 1 = right, -1 = left
 
 CRGB bassSparkles[NUM_LEDS];  // stores red flicker state
-uint8_t sparkleFlicker[NUM_LEDS] = {0};
-
 
 const int paletteBlendSpeed = 1;
 int trebleOverlayPos = 0;           // Start position for the segment
@@ -126,12 +122,11 @@ DEFINE_GRADIENT_PALETTE(greenIndigoOrangePalette) {
 
 
 DEFINE_GRADIENT_PALETTE(intenseRedPaletteWithIndigo) {
-  0, 255, 0, 0,       // Pure red
-  64,  255, 16, 16,     // Hot red
-  96,  200, 0, 0,       // Deep crimson
-  112, 255, 120, 0,     // 🔥 Gold-orange
-  128, 255, 200, 0,     // ✨ Bright gold
-  144, 255, 120, 0,     // 🔥 Gold-orange
+  192, 75,  0, 130,     // Indigo
+  224, 60,  0, 100,     // Deeper indigo
+  0,   255, 0, 0,       // Pure red
+  96,  255, 16, 16,     // Hot red
+  128, 200, 0, 0,       // Deep crimson
   160, 128, 0, 0,       // Darker red
   192, 75,  0, 130,     // Indigo
   224, 60,  0, 100,     // Deeper indigo
@@ -140,19 +135,13 @@ DEFINE_GRADIENT_PALETTE(intenseRedPaletteWithIndigo) {
 
 
 
-CRGB deepRedPalette[] = {
-  CRGB(90, 0, 0),
-  CRGB(120, 0, 0),
-  CRGB(200, 0, 0),
-  CRGB(255, 30, 30)
-};
-
-CRGBPalette16 sharedPalette = indigoPurpleBluePalette;
+CRGBPalette16 sharedPalette = indigoPurpleBluePalette;  // Main shared palette
 CRGBPalette16 targetSharedPalette = indigoPurpleBluePalette;
-CRGBPalette16 treblePalette = intenseRedPaletteWithIndigo;
-CRGBPalette16 previousPalette = sharedPalette;
+CRGBPalette16 treblePalette = intenseRedPaletteWithIndigo; // Separate for treble
+CRGBPalette16 previousPalette = sharedPalette;  // store the palette we're blending from
 unsigned long paletteBlendStart = 0;
 bool isBlending = false;
+
 
 
 // === Setup ===
@@ -181,19 +170,8 @@ void loop() {
   updateDynamicMaxBand();
   updateDynamicMaxTreble();
   printBandsForPlotter();
-  updatePaletteBlend();
-  updateBassBrightnessOverlay();
-
-
   unsigned long now = millis();  // <== ONLY declare this once here
-  static unsigned long lastPaletteBlendTime = 0;
-  
-  static unsigned long lastCycle = 0;
-  if (now - lastCycle > 10000) {  // every 30 seconds
-  cyclePalettes();
-  lastCycle = now;
-}
-  
+static unsigned long lastPaletteBlendTime = 0;
 
 // === Time-based palette blending ===
 if (isBlending) {
@@ -204,6 +182,7 @@ if (isBlending) {
     isBlending = false;
   } else {
     uint8_t blendAmount = map(elapsed, 0, paletteCycleDuration, 0, 255);
+    sharedPalette = blendPalettes(previousPalette, targetSharedPalette, blendAmount);
   }
 }
 
@@ -218,6 +197,8 @@ if (bassDeltaTrigger) {
 }
 lastSmoothBand1 = currentSmoothBand1;
 
+
+if (currentMode == "music") {
    float bassValue = smoothBands[selectedBand1];
   float trebleValue = smoothBands[selectedBand2];
     static int bassLitLength = 0;
@@ -252,7 +233,7 @@ if (bassValue > threshold1) {
   // Determine segment length based on intensity
   float intensity = (bassValue - threshold1) / (maxBandValue - threshold1);
   intensity = constrain(intensity, 0.0, 1.0);
-  bassLitLength = map(intensity * 100, 0, 100, 5, 18);
+  bassLitLength = map(intensity * 100, 0, 100, 6, 14);
 
   // Move lit segment in current direction
   bassLitStart += bassMoveDir * bassSegmentJump;
@@ -285,7 +266,7 @@ float intensityRatio = constrain((bassValue - threshold1) / (maxBandValue - thre
 
 
 // Sparkle chance and brightness scale with intensity
-uint8_t sparkleChance = map(intensityRatio * 100, 0, 100, 0, 23);
+uint8_t sparkleChance = map(intensityRatio * 100, 0, 100, 0, 30);
 uint8_t sparkleStrength = map(intensityRatio * 100, 0, 100, 60, 255);
 
 // Fade old sparkles
@@ -305,30 +286,24 @@ if (showBassGlitter) {
 
   for (int i = 0; i < NUM_LEDS; i++) {
   uint8_t index = map(i, 0, NUM_LEDS - 1, 0, 255);
-  uint8_t brightness = bassBrightnessOverlay[i];
+  bool inMain = (i >= bassLitStart && i < bassLitStart + bassLitLength);
+  bool isEdge = (i == bassLitStart - 1 || i == bassLitStart + bassLitLength);
 
-  // Base palette color using precomputed overlay
+  uint8_t brightness = baseBrightness;
+  if (inMain) {
+    brightness = currentBassBrightness;
+  } else if (isEdge) {
+    brightness = currentBassBrightness / 2;
+  }
+
+  // Base palette color
   leds1[i] = ColorFromPalette(sharedPalette, index, brightness);
 
-  // Flicker: sparkle decay & red flash
-  if (sparkleFlicker[i] > 0) {
-    sparkleFlicker[i] = qsub8(sparkleFlicker[i], 6);  // decay flicker
-    uint8_t flickerIndex = map(sparkleFlicker[i], 0, 255, 0, 3);
-    leds1[i] += deepRedPalette[flickerIndex];
-  }
-
-  // Blend in red sparkles on top of palette
-  leds1[i] = blend(leds1[i], bassSparkles[i], 128);
+  // Blend in persistent red sparkle effect
+  leds1[i] = blend(leds1[i], bassSparkles[i], 128);  // 50% blend strength
 }
 
 
-if (showBassGlitter) {
-  for (int i = bassLitStart; i < bassLitStart + bassLitLength; i++) {
-    if (i >= 0 && i < NUM_LEDS && random8() < sparkleChance) {
-      sparkleFlicker[i] = random8(160, 255);
-    }
-  }
-}
 
 
   // Base brightness on treble strip
@@ -395,7 +370,7 @@ void readMSGEQ7() {
     // Exponential moving average
     smoothBands[i] = scaledValue * 0.9 + previous * 0.1;
 
-    if (i == selectedBand2) {
+    if (i == trebleBand) {
       trebleHistory[trebleIndex] = smoothBands[i];
       trebleIndex = (trebleIndex + 1) % TREBLE_HISTORY;
     }
@@ -479,7 +454,7 @@ float computeAdaptiveTrebleThreshold(float* history, int length) {
 void updateDynamicMaxTreble() {
   static unsigned long lastTrebleUpdate = 0;
   unsigned long now = millis();
-  float currentTreble = smoothBands[selectedBand2];
+  float currentTreble = smoothBands[trebleBand];
 
   if (currentTreble > maxTrebleValue) {
     maxTrebleValue = min(currentTreble, maxBandValue2);
@@ -495,31 +470,11 @@ void updateDynamicMaxTreble() {
   trebleThreshold = computeAdaptiveTrebleThreshold(trebleHistory, TREBLE_HISTORY) * 1.8;
 }
 
-CRGBPalette16 blendedPalette;
-uint8_t paletteBlendAmount = 0;
 
-void updatePaletteBlend() {
-  if (isBlending) {
-    unsigned long elapsed = millis() - paletteBlendStart;
-
-    if (elapsed >= paletteCycleDuration) {
-      sharedPalette = targetSharedPalette;
-      isBlending = false;
-    } else {
-      paletteBlendAmount = map(elapsed, 0, paletteCycleDuration, 0, 255);
-      nblendPaletteTowardPalette(sharedPalette, targetSharedPalette, 8);  // gradual
-    }
+CRGBPalette16 blendPalettes(const CRGBPalette16& from, const CRGBPalette16& to, uint8_t amount) {
+  CRGBPalette16 result;
+  for (int i = 0; i < 16; i++) {
+    result.entries[i] = blend(from.entries[i], to.entries[i], amount);
   }
+  return result;
 }
-
-void updateBassBrightnessOverlay() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    bassBrightnessOverlay[i] = baseBrightness;
-  }
-  for (int i = bassLitStart; i < bassLitStart + bassLitLength; i++) {
-    if (i >= 0 && i < NUM_LEDS) {
-      bassBrightnessOverlay[i] = currentBassBrightness;
-    }
-  }
-}
-

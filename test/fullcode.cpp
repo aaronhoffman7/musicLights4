@@ -3,12 +3,20 @@
 
 // === Function Prototypes ===
 void readMSGEQ7();
+void handleSerialInput();
 void updateDynamicMaxBand();
+void bounceEffect(CRGB* leds, CRGBPalette16 palette, int trailLength, int pos, uint8_t hueShift);
+void rainbowEffect(CRGB* leds, int speed);
+void strobeEffect();
+void flashEffect();
+void vibesEffect(CRGB* leds, CRGBPalette16 palette);
+void updateBassLeds(CRGB* targetLeds, float bandValue, float threshold, CRGBPalette16 palette, uint8_t* timers);
+void updateTrebleLeds(CRGB* targetLeds, float bandValue, float threshold, CRGBPalette16 palette, uint8_t* timers);
 void cyclePalettes();
 void printBandsForPlotter();
+void readTouchInputs();
 void updateDynamicMaxTreble();
-void updatePaletteBlend();
-void updateBassBrightnessOverlay();
+CRGBPalette16 blendPalettes(const CRGBPalette16& from, const CRGBPalette16& to, uint8_t amount);
 
 
 // === Constants and Globals ===  
@@ -27,15 +35,29 @@ void updateBassBrightnessOverlay();
 #define STROBE_FLASH_SPEED 45      // milliseconds
 #define FLASH_DURATION 300         // milliseconds
 
+//buttons
+bool currentButtonState = HIGH;
+bool lastButtonState = HIGH;
+unsigned long lastButtonPollTime = 0;
+const unsigned long buttonPollInterval = 15;  // ~15ms button poll interval
+const int buttonPin = 32;
+
 //music variables
-const int noiseFloor = 50;
+const int noiseFloor = 45;
 int maxTrebleValue = 0;  // variable
-int maxTrebleValue2 = 750; //start value (decays from here)
+int maxTrebleValue2 = 650; //start value (decays from here)
 unsigned long lastTrebleTrigger = 0;
 unsigned long lastBassHit = 0;
+CRGB trebleColorDefault = CRGB(255, 0, 0);  // bright red for most palettes
+CRGB trebleColorAlt = CRGB(255, 0, 0);    // teal-blue for alternate vibe
 const int paletteCycleDuration = 10000;
+const int trebleBand = 4;
 int selectedBand1 = 1; // LED strip 1 (bass)
-int selectedBand2 = 5; // LED strip 2 (bass)
+int selectedBand2 = 4; // LED strip 2 (bass)
+
+uint8_t blendProgress = 0;
+unsigned long lastBlendTime = 0;
+bool blending = false;
 
 const int maxBassBrightness = 130;   // Higher maximum for bass hits
 const int maxTrebleBrightness = 220; // Higher maximum for treble hits
@@ -52,7 +74,7 @@ const int bassDeltaThreshold = 50;  // min gap between bass triggers (ms)
 const int trebleDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
 const int trebleDecayRaw = 1; // x / 1023
 const int bassDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
-const int bassDecayRaw = 1; // x / 1023
+const int bassDecayRaw = 3; // x / 1023
 int maxBandValue = 0; // max bass
 float maxBandValue2 = 800;  // Upper clamp for bass band value
 int burstLength = 4;            // number of LEDs to light up (1 on either side of center)
@@ -60,19 +82,18 @@ CRGB trebleBursts[NUM_LEDS];     // stores active burst overlays
 int trebleBurstPos = 0;      // Current position of treble burst center
 int trebleBurstDir = 1;      // +1 = right, -1 = left (bouncing direction)
 const int bassSegmentJump = 2;
-uint8_t bassBrightnessOverlay[NUM_LEDS] = {0};
 
 
 uint8_t currentBassBrightness = baseBrightness;
 uint8_t targetBassBrightness = baseBrightness;
 unsigned long bassFadeStart = 0;
-const unsigned long bassFadeDuration = 800;  // Fade back to base in 2.5 sec
+const unsigned long bassFadeDuration = 550;  // Fade back to base in 2.5 sec
 static int bassLitStart = 0;
 static int bassLitLength = 10;
 static int bassMoveDir = 1; // 1 = right, -1 = left
 
 CRGB bassSparkles[NUM_LEDS];  // stores red flicker state
-uint8_t sparkleFlicker[NUM_LEDS] = {0};
+
 
 
 const int paletteBlendSpeed = 1;
@@ -88,10 +109,41 @@ float lastSmoothBand1 = 0;
 float threshold1 = 0;
 
 float smoothBands[7];
+int currentPosition = 0;
+
+
+bool lightsOn = true;     // global on/off
+bool buttonPressed = false;
+bool strobeState = false;
+
+unsigned long lastStrobeFlash = 0;
+unsigned long strobeStartTime = 0;
+bool flashActive = false;
+unsigned long flashStartTime = 0;
 const int minLEDsLit = 1;
 
 CRGB leds1[NUM_LEDS];
 CRGB leds2[NUM_LEDS];
+CRGB targetLeds1[NUM_LEDS];
+CRGB targetLeds2[NUM_LEDS];
+CRGB trebleOverlay1[NUM_LEDS];
+CRGB trebleOverlay2[NUM_LEDS];
+uint8_t trebleOverlayFade = 0;
+
+
+uint8_t lingerTimers1[NUM_LEDS] = {0};
+uint8_t lingerTimers2[NUM_LEDS] = {0};
+const uint8_t lingerDuration = 100;  // frames to linger (~20 x 5ms = 100ms)
+
+String effectModes[] = {"off", "music", "treble", "vibes", "rainbow", "bounce"};
+const int numModes = sizeof(effectModes) / sizeof(effectModes[0]);
+int currentModeIndex = 0;
+String currentMode = effectModes[currentModeIndex];
+
+
+int bouncePosition = 0;
+int bounceDirection = 1;
+uint8_t bounceHueShift = 0;
 
 uint8_t colorScheme1 = 0;
 uint8_t colorScheme2 = 1;
@@ -126,12 +178,11 @@ DEFINE_GRADIENT_PALETTE(greenIndigoOrangePalette) {
 
 
 DEFINE_GRADIENT_PALETTE(intenseRedPaletteWithIndigo) {
-  0, 255, 0, 0,       // Pure red
-  64,  255, 16, 16,     // Hot red
-  96,  200, 0, 0,       // Deep crimson
-  112, 255, 120, 0,     // 🔥 Gold-orange
-  128, 255, 200, 0,     // ✨ Bright gold
-  144, 255, 120, 0,     // 🔥 Gold-orange
+  192, 75,  0, 130,     // Indigo
+  224, 60,  0, 100,     // Deeper indigo
+  0,   255, 0, 0,       // Pure red
+  96,  255, 16, 16,     // Hot red
+  128, 200, 0, 0,       // Deep crimson
   160, 128, 0, 0,       // Darker red
   192, 75,  0, 130,     // Indigo
   224, 60,  0, 100,     // Deeper indigo
@@ -140,24 +191,19 @@ DEFINE_GRADIENT_PALETTE(intenseRedPaletteWithIndigo) {
 
 
 
-CRGB deepRedPalette[] = {
-  CRGB(90, 0, 0),
-  CRGB(120, 0, 0),
-  CRGB(200, 0, 0),
-  CRGB(255, 30, 30)
-};
-
-CRGBPalette16 sharedPalette = indigoPurpleBluePalette;
+CRGBPalette16 sharedPalette = indigoPurpleBluePalette;  // Main shared palette
 CRGBPalette16 targetSharedPalette = indigoPurpleBluePalette;
-CRGBPalette16 treblePalette = intenseRedPaletteWithIndigo;
-CRGBPalette16 previousPalette = sharedPalette;
+CRGBPalette16 treblePalette = intenseRedPaletteWithIndigo; // Separate for treble
+CRGBPalette16 previousPalette = sharedPalette;  // store the palette we're blending from
 unsigned long paletteBlendStart = 0;
 bool isBlending = false;
+
 
 
 // === Setup ===
 void setup() {
   Serial.begin(115200);
+  pinMode(buttonPin, INPUT);
   pinMode(STROBE_PIN, OUTPUT);
   pinMode(RESET_PIN, OUTPUT);
   pinMode(ANALOG_PIN, INPUT);
@@ -170,30 +216,25 @@ void setup() {
   digitalWrite(STROBE_PIN, LOW);
   delay(1);
   digitalWrite(RESET_PIN, HIGH);
+
+  currentModeIndex = 0;
+  currentMode = effectModes[currentModeIndex];  // should be "music"
   for (int i = 0; i < 7; i++) smoothBands[i] = 0;
 }
 
 
 // === Main Loop ===
 void loop() {
-
+  handleSerialInput();
   readMSGEQ7();
   updateDynamicMaxBand();
   updateDynamicMaxTreble();
   printBandsForPlotter();
-  updatePaletteBlend();
-  updateBassBrightnessOverlay();
-
 
   unsigned long now = millis();  // <== ONLY declare this once here
-  static unsigned long lastPaletteBlendTime = 0;
-  
-  static unsigned long lastCycle = 0;
-  if (now - lastCycle > 10000) {  // every 30 seconds
-  cyclePalettes();
-  lastCycle = now;
-}
-  
+
+static unsigned long lastPaletteBlendTime = 0;
+unsigned long paletteBlendInterval = 39; // Try 100–300 ms for slower blending
 
 // === Time-based palette blending ===
 if (isBlending) {
@@ -204,8 +245,10 @@ if (isBlending) {
     isBlending = false;
   } else {
     uint8_t blendAmount = map(elapsed, 0, paletteCycleDuration, 0, 255);
+    sharedPalette = blendPalettes(previousPalette, targetSharedPalette, blendAmount);
   }
 }
+
 
   // Store previous smoothed value
 float currentSmoothBand1 = smoothBands[selectedBand1];
@@ -218,9 +261,59 @@ if (bassDeltaTrigger) {
 }
 lastSmoothBand1 = currentSmoothBand1;
 
+
+  if (now - lastButtonPollTime > buttonPollInterval) {
+      lastButtonPollTime = now;
+
+      currentButtonState = digitalRead(buttonPin);
+
+      if (currentButtonState == LOW && lastButtonState == HIGH) {
+          currentModeIndex = (currentModeIndex + 1) % numModes;
+          currentMode = effectModes[currentModeIndex];
+          Serial.print("Mode changed to: "); Serial.println(currentMode);
+      }
+      lastButtonState = currentButtonState;
+  }
+
+  if (currentMode != "off") {
+    static unsigned long lastPaletteChange = 0;
+    if (now - lastPaletteChange > paletteCycleDuration) {
+        cyclePalettes();
+        lastPaletteChange = now;
+    }
+}
+
+
+
+      if (currentMode == "bounce") {
+          bouncePosition += bounceDirection;
+          if (bouncePosition >= NUM_LEDS || bouncePosition < 0) {
+              bounceDirection *= -1;
+              bouncePosition += bounceDirection;
+          }
+          bounceHueShift++;
+          bounceEffect(leds1, sharedPalette, 7, bouncePosition, bounceHueShift);
+          bounceEffect(leds2, sharedPalette, 10, bouncePosition, bounceHueShift);
+          FastLED.show();
+          delay(30);
+      } 
+      else if (currentMode == "rainbow") {
+          rainbowEffect(leds1, 20);
+          rainbowEffect(leds2, 20);
+          FastLED.show();
+      }
+      else if (currentMode == "strobe") {
+          strobeEffect();
+      }
+      else if (currentMode == "flash") {
+          flashEffect();
+      }
+
+  if (currentMode == "music") {
    float bassValue = smoothBands[selectedBand1];
   float trebleValue = smoothBands[selectedBand2];
-    static int bassLitLength = 0;
+  static int bassStartIndex = 0;
+static int bassLitLength = 0;
 
 
   // Bass brightness mapping with baseBrightness fallback
@@ -252,7 +345,7 @@ if (bassValue > threshold1) {
   // Determine segment length based on intensity
   float intensity = (bassValue - threshold1) / (maxBandValue - threshold1);
   intensity = constrain(intensity, 0.0, 1.0);
-  bassLitLength = map(intensity * 100, 0, 100, 5, 18);
+  bassLitLength = map(intensity * 100, 0, 100, 6, 14);
 
   // Move lit segment in current direction
   bassLitStart += bassMoveDir * bassSegmentJump;
@@ -285,7 +378,7 @@ float intensityRatio = constrain((bassValue - threshold1) / (maxBandValue - thre
 
 
 // Sparkle chance and brightness scale with intensity
-uint8_t sparkleChance = map(intensityRatio * 100, 0, 100, 0, 23);
+uint8_t sparkleChance = map(intensityRatio * 100, 0, 100, 0, 30);
 uint8_t sparkleStrength = map(intensityRatio * 100, 0, 100, 60, 255);
 
 // Fade old sparkles
@@ -305,30 +398,24 @@ if (showBassGlitter) {
 
   for (int i = 0; i < NUM_LEDS; i++) {
   uint8_t index = map(i, 0, NUM_LEDS - 1, 0, 255);
-  uint8_t brightness = bassBrightnessOverlay[i];
+  bool inMain = (i >= bassLitStart && i < bassLitStart + bassLitLength);
+  bool isEdge = (i == bassLitStart - 1 || i == bassLitStart + bassLitLength);
 
-  // Base palette color using precomputed overlay
+  uint8_t brightness = baseBrightness;
+  if (inMain) {
+    brightness = currentBassBrightness;
+  } else if (isEdge) {
+    brightness = currentBassBrightness / 2;
+  }
+
+  // Base palette color
   leds1[i] = ColorFromPalette(sharedPalette, index, brightness);
 
-  // Flicker: sparkle decay & red flash
-  if (sparkleFlicker[i] > 0) {
-    sparkleFlicker[i] = qsub8(sparkleFlicker[i], 6);  // decay flicker
-    uint8_t flickerIndex = map(sparkleFlicker[i], 0, 255, 0, 3);
-    leds1[i] += deepRedPalette[flickerIndex];
-  }
-
-  // Blend in red sparkles on top of palette
-  leds1[i] = blend(leds1[i], bassSparkles[i], 128);
+  // Blend in persistent red sparkle effect
+  leds1[i] = blend(leds1[i], bassSparkles[i], 128);  // 50% blend strength
 }
 
 
-if (showBassGlitter) {
-  for (int i = bassLitStart; i < bassLitStart + bassLitLength; i++) {
-    if (i >= 0 && i < NUM_LEDS && random8() < sparkleChance) {
-      sparkleFlicker[i] = random8(160, 255);
-    }
-  }
-}
 
 
   // Base brightness on treble strip
@@ -367,6 +454,66 @@ if (showBassGlitter) {
   delay(5);
 }
 
+else if (currentMode == "treble") {
+    // Fade overlay
+    trebleOverlayFade = qsub8(trebleOverlayFade, trebleFadeSpeed);
+
+    // Clear LEDs by default (no bass visuals)
+   for (int i = 0; i < NUM_LEDS; i++) {
+  uint8_t paletteIndex = map(i, 0, NUM_LEDS - 1, 0, 255);
+  leds1[i] = ColorFromPalette(sharedPalette, paletteIndex, baseBrightness);
+  leds2[i] = ColorFromPalette(sharedPalette, paletteIndex, baseBrightness);
+}
+
+    // Treble detection and cooldown
+    bool trebleIsStrong = smoothBands[trebleBand] > trebleThreshold;
+    bool trebleCooldownElapsed = (now - lastTrebleTrigger > trebleCooldown);
+
+if (trebleIsStrong && trebleCooldownElapsed) {
+    trebleOverlayFade = trebleHitIntensity;
+    lastTrebleTrigger = now;
+
+    // Update position with bouncing behavior
+    trebleOverlayPos += trebleSegmentDirection * (segmentLength + 1);
+
+    if (trebleOverlayPos + segmentLength >= NUM_LEDS) {
+        trebleOverlayPos = NUM_LEDS- segmentLength;
+        trebleSegmentDirection = -1;  // Bounce back
+    } else if (trebleOverlayPos <= 0) {
+        trebleOverlayPos = 0;
+        trebleSegmentDirection = 1;   // Bounce forward
+    }
+}
+
+
+// Draw treble segment with fade
+if (trebleOverlayFade > 0) {
+  for (int i = 0; i < segmentLength; i++) {
+    int ledIndex = trebleOverlayPos + i;
+    if (ledIndex >= 0 && ledIndex < NUM_LEDS) {
+      CRGB overlayColor = ColorFromPalette(sharedPalette, i * (255 / segmentLength), trebleOverlayFade);
+      leds1[ledIndex] = blend(leds1[ledIndex], overlayColor, trebleBlend);
+      leds2[ledIndex] = blend(leds2[ledIndex], overlayColor, trebleBlend);  // optional
+    }
+  }
+}
+    FastLED.show();
+    delay(5);
+}
+
+    else if (currentMode == "vibes") {
+          vibesEffect(leds1, sharedPalette);
+          vibesEffect(leds2, sharedPalette);
+          FastLED.show();
+      }
+      
+      else if (currentMode == "off") {
+    FastLED.clear();
+    FastLED.show();
+      }
+
+}
+
 
 // Read MSGEQ7 values and smooth them
 void readMSGEQ7() {
@@ -395,7 +542,7 @@ void readMSGEQ7() {
     // Exponential moving average
     smoothBands[i] = scaledValue * 0.9 + previous * 0.1;
 
-    if (i == selectedBand2) {
+    if (i == trebleBand) {
       trebleHistory[trebleIndex] = smoothBands[i];
       trebleIndex = (trebleIndex + 1) % TREBLE_HISTORY;
     }
@@ -418,6 +565,29 @@ void printBandsForPlotter() {
   Serial.println(trebleThreshold, 2);  // Band 8
 }
 
+
+void updateTrebleLeds(CRGB* targetLeds, float trebleValue, float threshold, CRGBPalette16 palette, uint8_t* timers) {
+  if (trebleValue >= threshold) {
+    uint8_t trebleHitBrightness = map(trebleValue, threshold, maxTrebleValue, 100, maxTrebleBrightness);
+    trebleHitBrightness = constrain(trebleHitBrightness, 100, maxTrebleBrightness);
+
+    for (int i = 0; i < NUM_LEDS; i += trebleDensity) {
+      uint8_t paletteIndex = map(i, 0, NUM_LEDS - 1, 0, 255);
+      targetLeds[i] = ColorFromPalette(sharedPalette, paletteIndex, trebleHitBrightness);
+      timers[i] = lingerDuration;
+    }
+  }
+
+  for (int i = 0; i < NUM_LEDS; i++) {
+    if (timers[i] > 0) {
+      timers[i]--;
+      targetLeds[i].nscale8(trebleFadeSpeed);  // <-- now matches bass style
+    } else {
+      targetLeds[i] = CRGB::Black;
+    }
+  }
+}
+
 // Cycle through predefined palettes
 void cyclePalettes() {
   colorScheme1 = (colorScheme1 + 1) % 3;
@@ -433,6 +603,107 @@ void cyclePalettes() {
   isBlending = true;                 // Flag to activate timed blending
 }
 
+
+
+void handleSerialInput() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n'); // Read input until newline
+    input.trim(); // Remove extra spaces or line breaks
+
+    if (input == "bounce") {
+      currentMode = "bounce";
+      Serial.println("Mode set to BOUNCE");
+    } else if (input == "rainbow") {
+      currentMode = "rainbow";
+      Serial.println("Mode set to RAINBOW");
+    } else if (input == "s") {
+      currentMode = "strobe";
+      strobeStartTime = millis();
+      Serial.println("Strobe effect activated!");
+    } else if (input == "F" || input == "f") {
+      currentMode = "flash";
+      Serial.println("Flash effect activated!");
+    } else if (input == "vibes") {
+      currentMode = "vibes";
+      Serial.println("Vibes effect activated!");
+    } else if (input == "treble") {
+      currentMode = "treble";
+      Serial.println("Treble mode activated!");
+    } else if (input == "music") {
+      currentMode = "music";
+      Serial.println("Music mode activated!");
+    } else if (input == "off") {
+      currentMode = "off";
+      Serial.println("Lights off");
+    } else {
+      Serial.println("Unknown command. Available: bounce, rainbow, vibes, music, treble, off, s, F");
+    }
+  }
+}
+
+void bounceEffect(CRGB* leds, CRGBPalette16 sharedPalette, int trailLength, int pos, uint8_t hueShift) {
+  fadeToBlackBy(leds, NUM_LEDS, 30);
+
+  for (int i = 0; i < trailLength; i++) {
+    int trailPos = pos - i * bounceDirection;
+    if (trailPos >= 0 && trailPos < NUM_LEDS) {
+      uint8_t brightness = BRIGHTNESS / (i + 1);
+      uint8_t colorIndex = (hueShift + i * 10) % 255;
+      leds[trailPos] = ColorFromPalette(sharedPalette, colorIndex, 255);
+    }
+  }
+}
+
+void rainbowEffect(CRGB* leds, int speed) {
+  static uint8_t hue = 0; // Starting hue
+  fill_rainbow(leds, NUM_LEDS, hue, 7); // Fill LEDs with a rainbow
+  hue++; // Increment hue for animation
+  FastLED.show();
+  delay(speed);
+}
+
+void strobeEffect() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - strobeStartTime > STROBE_DURATION) {
+    currentMode = "music";  
+    return;
+  }
+
+  if (currentTime - lastStrobeFlash > STROBE_FLASH_SPEED) {
+    strobeState = !strobeState;
+    lastStrobeFlash = currentTime;
+  }
+
+  if (strobeState) {
+    fill_solid(leds1, NUM_LEDS, CRGB::Blue);
+    fill_solid(leds2, NUM_LEDS, CRGB::White);
+  } else {
+    fill_solid(leds1, NUM_LEDS, CRGB::Black);
+    fill_solid(leds2, NUM_LEDS, CRGB::Black);
+  }
+
+  FastLED.show();
+}
+
+void flashEffect(){
+
+  unsigned long currentTime = millis();
+
+  if (!flashActive) {
+    flashActive = true;
+    flashStartTime = currentTime;
+  }
+
+  if (currentTime - flashStartTime < FLASH_DURATION) {
+    fill_solid(leds1, NUM_LEDS, CRGB::Red);   // Bright burst color
+    fill_solid(leds2, NUM_LEDS, CRGB::Indigo);
+    FastLED.show();
+  } else {
+    flashActive = false;
+    currentMode = "music";  // Return to default mode after flash
+  }
+}
 
 void updateDynamicMaxBand() {
   static unsigned long lastBandUpdate = 0;
@@ -479,7 +750,7 @@ float computeAdaptiveTrebleThreshold(float* history, int length) {
 void updateDynamicMaxTreble() {
   static unsigned long lastTrebleUpdate = 0;
   unsigned long now = millis();
-  float currentTreble = smoothBands[selectedBand2];
+  float currentTreble = smoothBands[trebleBand];
 
   if (currentTreble > maxTrebleValue) {
     maxTrebleValue = min(currentTreble, maxBandValue2);
@@ -495,31 +766,33 @@ void updateDynamicMaxTreble() {
   trebleThreshold = computeAdaptiveTrebleThreshold(trebleHistory, TREBLE_HISTORY) * 1.8;
 }
 
-CRGBPalette16 blendedPalette;
-uint8_t paletteBlendAmount = 0;
+void vibesEffect(CRGB* leds, CRGBPalette16 sharedPalette) {
+  static uint8_t hueShift = 0;
+  static uint16_t sparkleTimer = 0;
 
-void updatePaletteBlend() {
-  if (isBlending) {
-    unsigned long elapsed = millis() - paletteBlendStart;
-
-    if (elapsed >= paletteCycleDuration) {
-      sharedPalette = targetSharedPalette;
-      isBlending = false;
-    } else {
-      paletteBlendAmount = map(elapsed, 0, paletteCycleDuration, 0, 255);
-      nblendPaletteTowardPalette(sharedPalette, targetSharedPalette, 8);  // gradual
-    }
-  }
-}
-
-void updateBassBrightnessOverlay() {
+  // Slowly fade existing LEDs to create trails
   for (int i = 0; i < NUM_LEDS; i++) {
-    bassBrightnessOverlay[i] = baseBrightness;
+    leds[i].fadeToBlackBy(8);  // Soft trailing effect
   }
-  for (int i = bassLitStart; i < bassLitStart + bassLitLength; i++) {
-    if (i >= 0 && i < NUM_LEDS) {
-      bassBrightnessOverlay[i] = currentBassBrightness;
-    }
+
+  // Occasionally add a sparkle at a random position
+  if (random8() < 50) {  // Adjust probability for density
+    int pos = random16(NUM_LEDS);
+    uint8_t colorIndex = (pos * 5 + hueShift) % 255;
+    leds[pos] += ColorFromPalette(sharedPalette, colorIndex, 255);  // Add color
   }
+
+  // Slowly rotate through palette colors
+  hueShift++;
+
+  FastLED.show();
+  delay(20);
 }
 
+CRGBPalette16 blendPalettes(const CRGBPalette16& from, const CRGBPalette16& to, uint8_t amount) {
+  CRGBPalette16 result;
+  for (int i = 0; i < 16; i++) {
+    result.entries[i] = blend(from.entries[i], to.entries[i], amount);
+  }
+  return result;
+}
