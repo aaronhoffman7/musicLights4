@@ -20,6 +20,7 @@ void initializeScreen();
 void updateDisplay();
 void handleButton();
 void handlePotentiometer();
+void resetToDefaults();
 
 // === Constants and Globals ===  
 
@@ -31,9 +32,14 @@ void handlePotentiometer();
 // Create display object
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-#define POT_PIN 23
+#define POT_PIN 32
 #define BUTTON_PIN 15
 int touchThreshold = 40;  // Adjust depending on your setup
+
+int initialPotRaw = -1;
+bool potLocked = true;
+const int potDeadzone = 20;  // Adjust as needed
+
 
 // msgeq7
 #define STROBE_PIN 12
@@ -53,68 +59,78 @@ int touchThreshold = 40;  // Adjust depending on your setup
 #define FLASH_DURATION 300         // milliseconds
 
 // music variables
-const int noiseFloor = 45;
-int maxTrebleValue = 0;  // variable
-unsigned long lastTrebleTrigger = 0;
-unsigned long lastBassHit = 0;
-const int paletteCycleDuration = 10000;
+
 int selectedBand1 = 1; // LED strip 1 (bass)
 int selectedBand2 = 5; // LED strip 2 (bass)
-
-const int maxBassBrightness = 140;   // Higher maximum for bass hits
-const int maxTrebleBrightness = 220; // Higher maximum for treble hits
-const int baseBrightness = 25; // very dim 
-const int trebleDensity = 4; // treble shows on every nth light on the strip 
-const int trebleBlend = 200; // n/255 ratio of how much treble overly blends with bass base
-
+const int paletteCycleDuration = 10000;
 float maxBandValue2 = 650;  // Upper clamp for bass band value
-int burstLength = 4;            // number of LEDs to light up (1 on either side of center)
 const unsigned long trebleCooldown = 60;  // minimum gap between treble triggers (ms)
 const uint8_t trebleHitIntensity = 255;     // more subtle brightness
-const float bassThresholdFactor = 0.45; //percentage of max band value that's considered within threshold
-const float trebleThresholdFactor = 0.3; //
+const unsigned long tuningTimeout = 5000;  // 5 seconds without input = exit tuning mode
 
+
+
+
+
+//adjust with potentiometer
+int noiseFloor = 45;
+int maxBassBrightness = 140;   // Higher maximum for bass hits
+int maxTrebleBrightness = 220; // Higher maximum for treble hits
+int baseBrightness = 40; // very dim 
+float bassThresholdFactor = 0.45; //percentage of max band value that's considered within threshold
+float trebleThresholdFactor = 0.3; //
 int bassDeltaThreshold = 100;  // min gap between bass triggers (ms)
 int trebleDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
 int trebleDecayRaw = 1; // x / 1023
 int bassDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
 int bassDecayRaw = 1; // x / 1023
 int bassSegmentJump = 2;
-
-const unsigned long bassFadeDuration = 800;  // Fade back to base in 2.5 sec
+int trebleSegmentJump = 2;
+unsigned long bassFadeDuration = 800;  // Fade back to base in 2.5 sec
 #define TREBLE_HISTORY 75  // number of past readings to average
 
-#define NUM_SETTINGS 6        // Number of tunable variables
 
-// === Tunable Variable Array ===
-int* tunableVars[NUM_SETTINGS] = {
-  &bassDeltaThreshold,
-  &trebleDecayMS,
-  &trebleDecayRaw,
-  &bassDecayMS,
-  &bassDecayRaw,
-  &bassSegmentJump
+
+enum SettingType { SET_INT, SET_FLOAT };
+
+struct TunableSetting {
+  const char* name;
+  void* ptr;
+  SettingType type;
+  float minVal;
+  float maxVal;
+  float defaultVal;
 };
 
-const char* settingNames[NUM_SETTINGS] = {
-  "Bass Delta",
-  "Treble Decay ms",
-  "Treble Decay Raw",
-  "Bass Decay ms",
-  "Bass Decay Raw",
-  "Bass Segment Jump"
+
+#define NUM_SETTINGS 12
+
+TunableSetting settings[NUM_SETTINGS] = {
+  { "Noise Floor",           &noiseFloor,           SET_INT,   0,   200,  45 },
+  { "Max Bass Brightness",   &maxBassBrightness,    SET_INT,   20,  255,  140 },
+  { "Max Treble Brightness", &maxTrebleBrightness,  SET_INT,   20,  255,  220 },
+  { "Base Brightness",       &baseBrightness,       SET_INT,   5,   150,  40 },
+  { "Bass Threshold Factor", &bassThresholdFactor,  SET_FLOAT, 0.01, 1.0, 0.45 },
+  { "Treble Threshold Fact.",&trebleThresholdFactor,SET_FLOAT, 0.01, 1.0, 0.3 },
+  { "Bass Delta",            &bassDeltaThreshold,   SET_INT,   10,  300,  100 },
+  { "Treble Decay ms",       &trebleDecayMS,        SET_INT,   10,  1000, 150 },
+  { "Treble Decay Raw",      &trebleDecayRaw,       SET_INT,   1,   15,   1 },
+  { "Bass Decay ms",         &bassDecayMS,          SET_INT,   10,  1000, 150 },
+  { "Bass Decay Raw",        &bassDecayRaw,         SET_INT,   1,   15,   1 },
+  { "Bass Segment Jump",     &bassSegmentJump,      SET_INT,   1,   8,    2 }
 };
 
-int settingMin[NUM_SETTINGS] = { 10, 10, 1, 10, 1, 1 };
-int settingMax[NUM_SETTINGS] = { 300, 1000, 15, 1000, 15, 8 };
 
+// don't change
+volatile bool isTuning = false;
+unsigned long lastTuningChange = 0;
 int currentSettingIndex = 0;
 unsigned long lastDebounceTime = 0;
 unsigned long debounceDelay = 250;
 bool lastButtonState = HIGH;
-
-
-// don't change
+int maxTrebleValue = 0;  // variable
+unsigned long lastTrebleTrigger = 0;
+unsigned long lastBassHit = 0;
 CRGB trebleBursts[NUM_LEDS];     // stores active burst overlays
 const uint8_t trebleFadeSpeed = 2;  // lower = slower fade, try 1–3
 int maxBandValue = 0; // max bass
@@ -143,7 +159,6 @@ CRGB leds1[NUM_LEDS];
 CRGB leds2[NUM_LEDS];
 uint8_t colorScheme1 = 0;
 uint8_t colorScheme2 = 1;
-
 
 
 DEFINE_GRADIENT_PALETTE(indigoPurpleBluePalette) {
@@ -223,7 +238,11 @@ void setup() {
   delay(1);
   digitalWrite(RESET_PIN, HIGH);
   for (int i = 0; i < 7; i++) smoothBands[i] = 0;
+  
   initializeScreen();
+  resetToDefaults(); 
+  updateDisplay(); // show Home Screen initially
+
 
   xTaskCreatePinnedToCore(
   displayTask,           // Task function
@@ -234,9 +253,7 @@ void setup() {
   &displayTaskHandle,    // Task handle
   0                      // Run on Core 0
 );
-
 }
-
 
 // === Main Loop ===
 void loop() {
@@ -248,9 +265,8 @@ void loop() {
   updatePaletteBlend();
   updateBassBrightnessOverlay();
   //updateDisplay();
-  //handleButton();
-  //handlePotentiometer();
-
+  handleButton();
+  handlePotentiometer();
 
   unsigned long now = millis();  // <== ONLY declare this once here
   static unsigned long lastPaletteBlendTime = 0;
@@ -440,7 +456,7 @@ if (showBassGlitter) {
 
   // Bounce center position
   int center = trebleBurstPos;
-  trebleBurstPos += trebleBurstDir * 2;
+  trebleBurstPos += trebleBurstDir * trebleSegmentJump;
 
   if (trebleBurstPos >= NUM_LEDS - 2 || trebleBurstPos <= 2) {
     trebleBurstDir *= -1;
@@ -470,6 +486,8 @@ if (showBassGlitter) {
 
 // Read MSGEQ7 values and smooth them
 void readMSGEQ7() {
+  analogRead(ANALOG_PIN);
+  delayMicroseconds(5);
   digitalWrite(RESET_PIN, HIGH);
   delayMicroseconds(1);
   digitalWrite(RESET_PIN, LOW);
@@ -533,7 +551,6 @@ void cyclePalettes() {
   isBlending = true;                 // Flag to activate timed blending
 }
 
-
 void updateDynamicMaxBand() {
   static unsigned long lastBandUpdate = 0;
   unsigned long now = millis();
@@ -551,7 +568,6 @@ void updateDynamicMaxBand() {
 
   threshold1 = maxBandValue * bassThresholdFactor;  // Or whatever % works well
 }
-
 
 float computeAdaptiveTrebleThreshold(float* history, int length) {
   float sorted[length];
@@ -576,8 +592,6 @@ float computeAdaptiveTrebleThreshold(float* history, int length) {
 
   return sum / (length - startIdx);
 }
-
-
 
 void updateDynamicMaxTreble() {
   static unsigned long lastTrebleUpdate = 0;
@@ -612,7 +626,6 @@ void updateDynamicMaxTreble() {
   if (trebleThreshold < 30) trebleThreshold = 30;
 }
 
-
 CRGBPalette16 blendedPalette;
 uint8_t paletteBlendAmount = 0;
 
@@ -642,7 +655,7 @@ void updateBassBrightnessOverlay() {
 }
 
 void initializeScreen() {
-   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_I2C_ADDR)) {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_I2C_ADDR)) {
     Serial.println(F("SSD1306 init failed"));
     while (true);
   }
@@ -650,93 +663,146 @@ void initializeScreen() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-
-  // Startup screen
   display.setCursor(0, 0);
   display.println(F("MSGEQ7 Visualizer"));
   display.println(F("Initializing..."));
   display.display();
   delay(1000);
-
-  // Draw static labels
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println(F("MSGEQ7 Visualizer"));
-  display.setCursor(0, 20);
-  display.println(F("Bass:"));
-  display.setCursor(0, 35);
-  display.println(F("Treble:"));
-  display.display();
 }
 
 void updateDisplay() {
   display.clearDisplay();
+  display.setCursor(0, 0);
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  display.setCursor(0, 0);
-  display.println("MSGEQ7 Visualizer");
-
-  display.setCursor(0, 20);
-  display.print("Bass ");
-  display.print(selectedBand1);
-  display.print(": ");
-  display.println((int)smoothBands[selectedBand1]);
-
-  display.setCursor(0, 35);
-  display.print("Treble ");
-  display.print(selectedBand2);
-  display.print(": ");
-  display.println((int)smoothBands[selectedBand2]);
-
-  display.setCursor(0, 50);
-  display.print(settingNames[currentSettingIndex]);
-  display.print(": ");
-  display.println(*tunableVars[currentSettingIndex]);
+  if (isTuning) {
+    TunableSetting& s = settings[currentSettingIndex];
+    display.println("TUNING:");
+    display.println(s.name);
+    display.print("Val: ");
+    if (s.type == SET_INT)
+      display.println(*((int*)s.ptr));
+    else
+      display.println(*((float*)s.ptr), 2);
+  } else {
+    display.println("MSGEQ7 Visualizer");
+    display.setCursor(0, 20);
+    display.println("Visualizer Running...");
+    // Optional: show palette name or mode here
+  }
 
   display.display();
 }
 
+
 void displayTask(void* parameter) {
+  bool lastTuningState = isTuning;
+
   while (true) {
-    updateDisplay();           // Update screen content
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // Refresh every 1 second
+    if (isTuning && millis() - lastTuningChange > tuningTimeout) {
+  isTuning = false;
+  lastTuningState = false;
+  updateDisplay();  // Now back to Home Screen
+}
+ else if (isTuning != lastTuningState) {
+      updateDisplay();
+      lastTuningState = isTuning;
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
-
-
 void handleButton() {
-  int touchValue = touchRead(BUTTON_PIN);  // Lower = touch detected
+  static unsigned long pressStart = 0;
+  static bool wasPressed = false;
 
-  static bool wasTouched = false;
-  static unsigned long lastChange = 0;
+  bool pressed = touchRead(BUTTON_PIN) < touchThreshold;
 
-  bool isTouched = (touchValue < touchThreshold);
+  if (pressed && !wasPressed) {
+    // Just pressed
+    pressStart = millis();
+  } 
+  else if (!pressed && wasPressed) {
+    // Just released
+    unsigned long pressDuration = millis() - pressStart;
 
-  if (isTouched && !wasTouched && millis() - lastChange > debounceDelay) {
-    lastChange = millis();
-    currentSettingIndex = (currentSettingIndex + 1) % NUM_SETTINGS;
-    Serial.print("Selected: ");
-    Serial.println(settingNames[currentSettingIndex]);
+    if (pressDuration > 1500) {
+      resetToDefaults();  // Long press
+    } else {
+      // === Short press: advance setting ===
+      currentSettingIndex = (currentSettingIndex + 1) % NUM_SETTINGS;
+      isTuning = true;
+      lastTuningChange = millis();
+
+      initialPotRaw = analogRead(POT_PIN);  // Lock pot position
+      potLocked = true;
+
+      updateDisplay();
+    }
   }
 
-  wasTouched = isTouched;
+  wasPressed = pressed;
 }
 
 void handlePotentiometer() {
-  int raw = analogRead(POT_PIN);  // 0–4095 on ESP32
-  int mappedValue = map(raw, 0, 4095,
-                        settingMin[currentSettingIndex],
-                        settingMax[currentSettingIndex]);
+  if (!isTuning) return;
 
-  static int lastValue = -1;
-  if (abs(mappedValue - lastValue) > 1) {
-    *(tunableVars[currentSettingIndex]) = mappedValue;
-    lastValue = mappedValue;
+  analogRead(POT_PIN);  // dummy read for ADC settling
+  delayMicroseconds(5);
+  int raw = analogRead(POT_PIN);
 
-    Serial.print(settingNames[currentSettingIndex]);
-    Serial.print(": ");
-    Serial.println(mappedValue);
+  if (potLocked) {
+    if (abs(raw - initialPotRaw) < potDeadzone) {
+      return;  // Don't change setting yet
+    } else {
+      potLocked = false;  // Pot has moved, unlock it
+    }
   }
+
+  TunableSetting& setting = settings[currentSettingIndex];
+
+  int mapped = map(raw, 0, 4095, (int)setting.minVal, (int)setting.maxVal);
+
+  static int lastValue = -9999;
+  int threshold = ((int)setting.maxVal - (int)setting.minVal < 10) ? 0 : 1;
+
+  if (abs(mapped - lastValue) >= threshold) {
+    if (setting.type == SET_INT) {
+      *((int*)setting.ptr) = mapped;
+    } else {
+      float mappedFloat = map(raw, 0, 4095, 0, 1000) / 1000.0;
+      *((float*)setting.ptr) = mappedFloat * (setting.maxVal - setting.minVal) + setting.minVal;
+    }
+
+    lastValue = mapped;
+    updateDisplay();  // Only update screen if it changed
+  }
+
+  // Always extend tuning timeout when pot is touched
+  lastTuningChange = millis();
+}
+
+
+
+void resetToDefaults() {
+  for (int i = 0; i < NUM_SETTINGS; i++) {
+    if (settings[i].type == SET_INT)
+  *((int*)settings[i].ptr) = (int)settings[i].defaultVal;
+else
+  *((float*)settings[i].ptr) = settings[i].defaultVal;
+  }
+  Serial.println("Settings reset to default.");
+  isTuning = true;
+  lastTuningChange = millis();
+
+  // Optional: show confirmation
+  display.clearDisplay();
+  display.setCursor(0, 30);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.println("Defaults Restored");
+  display.display();
+  delay(1000);
 }
