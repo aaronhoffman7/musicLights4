@@ -3,45 +3,41 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Wire.h>
-
+#include <string.h>
 // Forward declarations for types used in prototypes
 struct Cloud;
 struct StaticPulse;  // optional (you already use 'struct StaticPulse*' in a proto so it's ok either way)
+struct Param;
 // ---- forward declares so earlier code can see these ----
 struct EffectEntry { const char* name; void (*fn)(); }; // if not already visible here
-// --- fwd used by makeMusicFrame & MUSIC_EFFECTS ---
-uint8_t sens(uint8_t n);          // defined later (inline uses GATE_SENS_Q8)
-extern uint8_t bandNorm[7];       // from MSGEQ7 section
-extern uint8_t audioPeakN;        // from MSGEQ7 section
 
+
+void handleInputs();
+void handlePotentiometer();
+void handleTouchButtons();
+void updateDisplay();
+void readMSGEQ7();
+void setMusicPalette(uint8_t idx);
+void addPartySegmentOverlay_MusicDark();
+void spawnSegment(int start, int len, bool isBass);
+void spawnSegmentStrong(int start, int len, bool isBass, uint8_t vMax);
+void addSegmentOverlay();
+void dumpIOOnce();
+void uiTick();
+void initNewUI();
 
 // ==== New function prototypes ====
 void fx_segmentDJ();
 void renderPaletteClouds(CRGB* led, bool reverseIndex,
-                         const CRGBPalette16& pal, uint8_t baseV, Cloud* C,
-                         uint16_t t1, uint16_t t2, uint16_t t3);
+const CRGBPalette16& pal, uint8_t baseV, Cloud* C);
 void addRippleOverlay();
+void renderSegmentBackground();
 void spawnRipple(int center, bool isBass);
 void spawnStaticPulse(bool onStrip1, int headIdx, bool dirRight);
 void renderStaticPulses(struct StaticPulse* arr, CRGB* strip);
-void drawHome();
-void initNewUI();
-void uiTick();
-void handleInputs();
-void handlePotentiometer();
-void handleTouchButtons();
-void readMSGEQ7();
-void fx_paletteFlow();
-void addSegmentOverlay();
-void spawnSegmentStrong(int start, int len, bool isBass, uint8_t vMax);
-void dumpIOOnce();
-// ---- Palette blend control (defaults & prototypes) ----
-constexpr uint16_t PALETTE_BLEND_MS_DEFAULT = 1;   // fast manual fade
 
-void setMusicPalette(uint8_t idx);                                   // 1-arg wrapper
-void setMusicPalette(uint8_t idx, uint16_t ms, bool instant);        // main impl
-
-
+// Bank/control helpers (if you want prototypes up top as well)
+int  readPotFiltered(uint8_t pin, int &lastRaw, int dead);
 
 // === POTENTIOMETERS ===
 #define POT1_PIN 32   // original 
@@ -66,25 +62,11 @@ void setMusicPalette(uint8_t idx, uint16_t ms, bool instant);        // main imp
 #define BTN_G 35  // Down
 #define BTN_H 33  // Settings / Back (hold = panic to Music)
 
-// LED strips
-
-#define NUM_LEDS   600
-#define CHIPSET    WS2812B
-#define COLOR_ORDER GRB
-#define BRIGHTNESS  160
-
-// Screen
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define SCREEN_ADDR 0x3C
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-
-// Bank/control helpers (if you want prototypes up top as well)
-int  readPotFiltered(uint8_t pin, int &lastRaw, int dead);
-
 // ---- at the top ----
 constexpr bool BTN_ACTIVE_LOW = true;   // set false if using pulldown / to 3V3
+constexpr bool LASER_BTN_ACTIVE_LOW = true;  // same for the laser toggle
+
+
 
 inline bool btnPressed(int pin) {
   int lvl = digitalRead(pin);
@@ -92,15 +74,32 @@ inline bool btnPressed(int pin) {
 }
 inline int btnIdleLevel() { return BTN_ACTIVE_LOW ? HIGH : LOW; }
 
+
 int touchThreshold = 40;
+int initialPotRaw = -1;
+bool potLocked = true;
+const int potDeadzone = 20;
 
 // Sensitivity (right knob) commit deadband after pickup
 static int  potB_lastCommitRaw = -1;
 const  int  SENS_COMMIT_RAW = 120;   // ~3% of 0..4095; tweak to taste
 
+
+// LED strips
+
+#define NUM_LEDS   600
+#define CHIPSET    WS2812B
+#define COLOR_ORDER GRB
+#define BRIGHTNESS  160
+
 CRGB leds1[NUM_LEDS];
 CRGB leds2[NUM_LEDS];
 
+// Screen
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define SCREEN_ADDR 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 // top of file, near the display object:
 bool displayOK = false;
 
@@ -121,10 +120,13 @@ static int  potEntryRaw = -1;             // raw at entry to adjust
 const  int  POT_PICKUP_DEAD = 40;         // << significant movement
 static int  potLastCommitRaw = -1;        // last raw that produced change
 
-// whats being adjusted now
-enum ParamTarget { PT_NONE, PT_MUSIC_GATE, PT_BASS, PT_TREBLE, PT_PALETTE, PT_FLASHSET, PT_SENSITIVITY, PT_LASER_GATE};
+// Which param is being adjusted now
+enum ParamTarget { PT_NONE, PT_MUSIC_GATE, PT_BASS, PT_TREBLE, PT_PALETTE, PT_FLASHSET, PT_SENSITIVITY};
 static ParamTarget activeParam = PT_NONE;
 
+// Home -> pressing B/C/D changes FX; H (hold) forces Music mode
+// Settings main menu items:
+enum SettingsItem { SI_MUSIC=0, SI_PALETTE, SI_FLASH, SI_KNOBMODE, SI_COUNT };
 
 enum PotMode : uint8_t { PM_BRIGHT_MUSIC = 0, PM_BASS_TREBLE = 1 };
 static PotMode potMode = PM_BRIGHT_MUSIC;
@@ -133,10 +135,16 @@ static PotMode potMode = PM_BRIGHT_MUSIC;
 static bool potA_pickupLocked = true, potB_pickupLocked = true;
 static int  potA_entryRaw = -1,     potB_entryRaw = -1;
 
-// Global smoothed scene (shared by effects)
-static float g_sceneLevel = 0.0f;
 
-uint32_t suppressPalUntil = 0;
+struct Param {
+  const char* name;
+  void*  ptr;       // int* or float*
+  enum { P_INT, P_FLOAT, P_U8 } type;
+  int    iMin, iMax, iDefault;  // for INT/U8
+  float  fMin, fMax, fDefault;  // for FLOAT
+  int    stepCoarse;            // e.g., 10 for gates
+  int    stepFine;              // e.g., 2 for gates
+};
 
 // Debounce & edge state
 struct BtnState {
@@ -195,19 +203,6 @@ uint32_t nextPaletteCycle  = 0;
 const uint32_t PALETTE_CYCLE_MS = 16UL * 1000UL; // 16,000 ms = 16 seconds
 
 
-
-// Settings menu rows (used by drawSettingsRoot / tickSettingsRoot)
-enum SettingsItem : uint8_t {
-  SI_MUSIC = 0,       // "Music" -> UI_SETTINGS_MUSIC
-  SI_PALETTE,         // "Palette Color" -> PT_PALETTE
-  SI_FLASH,           // "Flash Color"   -> PT_FLASHSET
-  SI_KNOBMODE,        // toggle Bright+Music <-> Bass+Treble
-  SI_LASER_AUTO,      // toggle LASER_AUTO_ENABLED
-  SI_LASER_GATE,      // adjust PT_LASER_GATE
-  SI_COUNT
-};
-
-
 // ---- Arrow control modes (what Up/Down adjust) ----
 enum ArrowMode : uint8_t {
   ARROW_STROBE_COLOR = 0,
@@ -238,7 +233,6 @@ const int     DEFAULT_TREBLE_GATE = 350;
 const uint8_t DEFAULT_FLASHSET    = 0;
 
 // === Laser control (keyboard + button) ===
-bool LASER_AUTO_ENABLED = true;   // master toggle shown in Settings
 bool laserOn = false;                           // latched state
 unsigned long laserPulseUntil = 0;              // momentary pulse deadline
 const unsigned long LASER_PULSE_MS = 250;       // 'L' key pulse length (ms)
@@ -246,16 +240,9 @@ bool laserAutoState = false; // Auto laser state (music-driven)
 unsigned long laserStrobeStart = 0;
 const unsigned long LASER_STROBE_DURATION = 500;  // ms burst length
 const uint16_t LASER_STROBE_SPEED = 60;           // ms per toggle (fast flash)
-int  LASER_GATE_THRESH = 160;   // adjust to taste (0..900 scale like bands)
+int  LASER_GATE_THRESH = 700;   // adjust to taste (0..900 scale like bands)
 bool laserStrobeActive = false; // strobe currently running?
 unsigned long lastLaserTrigger = 0;
-
-// LED dimmer for laser toggles (255 = full, 0 = black)
-uint8_t  laserDim        = 255;
-uint8_t  laserDimTarget  = 255;
-// Tune fade speed (ms for full sweep)
-const uint16_t LASER_FADE_MS = 1000;
-
 
 bool debugBands = false;
 unsigned long lastBandsPrint = 0;
@@ -294,7 +281,7 @@ const bool     POP_EDGE_WHITE = true; // white edge on segment during flash/hold
 static float bandFast[7]   = {0};   // fast envelope (current loudness)
 static float bandFloor[7]  = {0};   // adaptive noise floor per band
 static float bandCrest[7]  = {1};   // adaptive peak (headroom) per band
-uint8_t bandNorm[7] = {0};   // 0..255 normalized loudness per band
+static uint8_t bandNorm[7] = {0};   // 0..255 normalized loudness per band
 
 // Tunables (good starting points)
 const float EMA_FAST   = 0.35f;   // fast envelope attack
@@ -311,7 +298,8 @@ const uint8_t  CONFETTI_PER_SPAWN  = 1;   // new dots per strip each spawn
 
 // Convenience
 inline int   normTo900(uint8_t n){ return (int)((n * 900 + 127) / 255); }
-uint8_t audioPeakN = 0;     // max over bands, 0..255
+static uint8_t audioPeakN = 0;     // max over bands, 0..255
+static bool    audioQuiet = true;  // true when everything is near floor
 
 
 // ===== Dark/Music per-band gates =====
@@ -362,6 +350,9 @@ const uint16_t STATIC_PULSE_MS   = 850; // lifespan of the burst
 const int32_t  STATIC_PULSE_PPS  = 200; // travel speed (px/s) ~140px over 200ms
 const uint8_t  STATIC_PULSE_LEN  = 20;  // window length (px)
 const uint8_t  STATIC_INTENSITY  = 100; // blend strength (0..255)
+
+void spawnStaticPulse(bool onStrip1, int headIdx, bool dirRight);
+void renderStaticPulses(StaticPulse* arr, CRGB* strip);
 
 // Last-hit timers for independent debouncing
 static unsigned long lastBassHitMs   = 0;
@@ -443,19 +434,6 @@ static inline int scaledLen_u8(uint8_t n, uint8_t gateN, int baseLen, int boost)
   return scaledLen(n, gateN, baseLen, boost);
 }
 
-// Smoothed scene energy from peakN (keeps stage/camera pleasant)
-static inline void updateSceneLevel(uint8_t peakN) {
-  float target = peakN / 255.0f;
-  float alpha  = 0.10f + 0.15f * target;   // more responsive when loud
-  g_sceneLevel = (1.0f - alpha) * g_sceneLevel + alpha * target;
-}
-
-static inline void setLaserLatched(bool on) {
-  laserOn = on;
-  uiLastActivityMs = millis();
-  drawHome();
-}
-
 
 bool flashHeldTouch = false;
 
@@ -493,9 +471,14 @@ enum EscState { ESC_IDLE, ESC_SEEN, ESC_BRACKET };
 static EscState escState = ESC_IDLE;
 
 
+
 // ==== MUSIC PALETTES (1..9) ====
 uint8_t musicPaletteIndex = 2; // 0-based
-
+CRGBPalette16 startPal;
+CRGBPalette16 targetPal;
+unsigned long blendStartTime = 0;
+unsigned long blendDuration  = 250;
+bool blending = false;
 
 const CRGBPalette16 PALETTE_TEAL_MAGENTA(
   CRGB::Teal, CRGB::Teal, CRGB::Aqua, CRGB::Aqua,
@@ -568,17 +551,28 @@ const CRGBPalette16 musicPalettes[] = {
 
 // === Hard-coded accent colors per palette (index must match musicPalettes[]) ===
 // Tune these to taste per palette for consistent stage vibes.
-struct Accents { CRGB bass, treble; };
-const Accents ACCENT[9] = {
-  { CRGB::BlueViolet, CRGB::Red },   // Rainbow
-  { CRGB::Blue,       CRGB::Red },   // Party
-  { CRGB::Indigo,     CRGB::Red },   // Ocean
-  { CRGB::Indigo,     CRGB::Red },   // Forest
-  { CRGB::Blue,       CRGB::Violet },// Heat
-  { CRGB::Indigo,     CRGB::Red },   // Dark
-  { CRGB::Blue,       CRGB::Red },   // Lava
-  { CRGB::Red,        CRGB::Red },   // RainbowStripe
-  { CRGB::Indigo,     CRGB::Red }    // TealMagenta
+const CRGB BASS_ACCENT[9] = {
+  CRGB::BlueViolet,        // Rainbow
+  CRGB::Blue,   // Party
+  CRGB::Indigo, // Ocean
+  CRGB::Indigo,   // Forest
+  CRGB::Blue,       // Heat
+  CRGB::Indigo,     // Dark
+  CRGB::Blue,        // Lava
+  CRGB::Red,      // RainbowStripe
+  CRGB::Indigo       // TealMagenta
+};
+
+const CRGB TREBLE_ACCENT[9] = {
+  CRGB::Red,        // Rainbow
+  CRGB::Red,   // Party
+  CRGB::Red, // Ocean
+  CRGB::Red,   // Forest
+  CRGB::Violet,       // Heat
+  CRGB::Red,     // Dark
+  CRGB::Red,        // Lava
+  CRGB::Red,      // RainbowStripe
+  CRGB::Red       // TealMagenta
 };
 
 // Small, fast filter (8x average). ADC is cheap; this removes shimmer.
@@ -614,29 +608,7 @@ const char* musicPaletteNames[] = {
 };
 const uint8_t MUSIC_PALETTE_COUNT = sizeof(musicPalettes)/sizeof(musicPalettes[0]);
 
-// palette state
-static CRGBPalette16 currentPal = musicPalettes[musicPaletteIndex];
-static CRGBPalette16 targetPal  = musicPalettes[musicPaletteIndex];
-
-// time-based crossfade
-static uint16_t palBlendMs   = 0;
-static uint32_t palBlendLast = 0;
-
-inline void stepPaletteBlend() {
-  uint32_t now = millis();
-  uint32_t dt  = now - palBlendLast;
-  palBlendLast = now;
-
-  if (palBlendMs == 0) { currentPal = targetPal; return; }
-  if (dt == 0) return;
-
-  uint32_t step32 = (dt * 255UL) / palBlendMs;      // how far to move this frame
-  uint8_t  step   = (step32 == 0) ? 1 : (step32 > 255 ? 255 : (uint8_t)step32);
-  nblendPaletteTowardPalette(currentPal, targetPal, step);
-}
-
-
-
+static CRGBPalette16 currentPal = musicPalettes[0];
 // === Flicker engine state (shared by DJ Segments) ===
 static uint32_t flickerTickMs = 0;
 static uint8_t  flickerSeed   = 0;
@@ -690,14 +662,10 @@ static bool    potPickup    = true;
 static bool bouncePotTargetsLen = true; // default Length (tap F to toggle)
 
 inline PotRole computePotRole() {
-  if (ui == UI_PARAM_ADJUST) return PR_NONE;
-  if (ui == UI_HOME)          return PR_HOME_BRIGHT;
+  if (ui == UI_PARAM_ADJUST) return PR_NONE;          // dedicated adjust owns the pot
+  if (ui == UI_HOME)          return PR_HOME_BRIGHT;  // always brightness on Home
 
-  // Give Bounce the pot even outside the FX_TWEAK screen
-  if (currentMode == FX_MODE && currentEffect == FX_BOUNCE) {
-    return PR_BOUNCE_LEN;
-  }
-
+  // FX tweak screen: route by current FX
   if (ui == UI_FX_TWEAK && currentMode == FX_MODE) {
     if (currentEffect == FX_BOUNCE)
       return bouncePotTargetsLen ? PR_BOUNCE_LEN : PR_BOUNCE_SPEED;
@@ -706,7 +674,6 @@ inline PotRole computePotRole() {
   }
   return PR_NONE;
 }
-
 
 
 
@@ -768,7 +735,7 @@ void setup() {
   } else {
     display.clearDisplay();
     display.display();
-    drawHome();
+    updateDisplay();
   }
 
   // === Add in setup() after Serial.begin(...) ===
@@ -779,7 +746,7 @@ analogSetPinAttenuation(POT2_PIN, ADC_11db);  // GPIO 15 is ADC2; fine if WiFi i
 
   display.clearDisplay();
   display.display();
-  drawHome();
+  updateDisplay();
   
     initNewUI();
 
@@ -800,7 +767,7 @@ b2DirRight = false;
 auto initClouds = [](Cloud* C, float baseSpeed){
   for (uint8_t i=0;i<CLOUD_COUNT;i++){
     C[i].center = random16(NUM_LEDS);
-    C[i].length = (float)random((long)CLOUD_MIN_LEN, (long)CLOUD_MAX_LEN);
+    C[i].length = random(CLOUD_MIN_LEN, CLOUD_MAX_LEN);
     C[i].speed  = baseSpeed * (0.7f + (random8()/255.0f)*0.6f); // ±30% variation
     C[i].wobble = random16(); // random phase
   }
@@ -822,129 +789,112 @@ cloudsLastUs = micros();
 
 // ============== LOOP ==============
 void loop() {
-  stepPaletteBlend();          
-  // ----- Auto palette cycling (Music mode) -----
-if (currentMode == MUSIC_MODE && autoCyclePal) {
-  unsigned long now = millis();
-  if ((long)(now - nextPaletteCycle) >= 0) {
-    uint8_t next = (musicPaletteIndex + 1) % MUSIC_PALETTE_COUNT;
-    // for auto cycle we do NOT boost (gentler crossfade)
-    setMusicPalette(next);
-    nextPaletteCycle = now + PALETTE_CYCLE_MS;
-  }
-}
-
   handleInputs();
   uiTick();
-
-  CLOUD_EDGE = (float)map(CLOUD_EDGE_SOFT_KNOB, 10, 200, 20, 90);
+  CLOUD_EDGE = (float)map(CLOUD_EDGE_SOFT_KNOB, 10, 200, 20, 90); // softer ↔ sharper edges
 
   handlePotentiometer();
   handleTouchButtons();
   laserAutoState = false;
 
-  if (currentMode == MUSIC_MODE) {
-    readMSGEQ7();
-    updateSceneLevel(sens(audioPeakN));
-    fx_paletteFlow();                  // single music renderer
-  } else {
-    FX[currentEffect].fn();            // manual FX
-  }
+  // Auto-cycle palettes in Music mode
+if (currentMode == MUSIC_MODE && autoCyclePal && millis() >= nextPaletteCycle) {
+  uint8_t nextIdx = (musicPaletteIndex + 1) % MUSIC_PALETTE_COUNT;
+  setMusicPalette(nextIdx);                   // uses your existing smooth blend
+  nextPaletteCycle += PALETTE_CYCLE_MS;       // schedule the next hop
+}
 
   // ===== Blackout short-circuit =====
-  if (blackoutActive) {
-    fadeToBlackBy(leds1, NUM_LEDS, BLACKOUT_FADE_STEP);
-    fadeToBlackBy(leds2, NUM_LEDS, BLACKOUT_FADE_STEP);
-    FastLED.show();
-    digitalWrite(LASER_PIN, LOW);
-    return;
+if (blackoutActive) {
+  fadeToBlackBy(leds1, NUM_LEDS, BLACKOUT_FADE_STEP);
+  fadeToBlackBy(leds2, NUM_LEDS, BLACKOUT_FADE_STEP);
+  FastLED.show();
+
+  // ensure outputs follow blackout too
+  digitalWrite(LASER_PIN, LOW);
+  return;
+}
+
+
+  if (currentMode == MUSIC_MODE) {
+    readMSGEQ7();
+    fx_paletteFlow();   // music-reactive only in MUSIC_MODE
+  } else {
+    FX[currentEffect].fn(); // Manual FX mode
   }
 
-  // ===== Touch overlays (flash) =====
-  const unsigned long nowMs = millis();
-  static uint8_t flashLevel = 0;  // 0..255
-  bool flashPressed = flashHeldTouch || (nowMs < flashPulseUntil);
-  if (flashPressed) flashLevel = 255;
-  else if (flashLevel > 0) flashLevel = (flashLevel > FLASH_DECAY_PER_FRAME) ? (flashLevel - FLASH_DECAY_PER_FRAME) : 0;
-
-  if (flashLevel > 0) {
-    CRGB c1 = FLASH_SETS[flashSetIdx].s1;
-    CRGB c2 = FLASH_SETS[flashSetIdx].s2;
-    c1.nscale8_video(flashLevel);
-    c2.nscale8_video(flashLevel);
-    for (int i = 0; i < NUM_LEDS; i++) {
-      nblend(leds1[i], c1, flashLevel);
-      nblend(leds2[i], c2, flashLevel);
-    }
+  // ===== Touch overlays =====
+const unsigned long nowMs = millis();
+static uint8_t flashLevel = 0;  // 0..255
+bool flashPressed = flashHeldTouch || (nowMs < flashPulseUntil);
+if (flashPressed) {
+  flashLevel = 255; // instant to full on press
+} else if (flashLevel > 0) {
+  flashLevel = (flashLevel > FLASH_DECAY_PER_FRAME)
+               ? (flashLevel - FLASH_DECAY_PER_FRAME)
+               : 0; // smooth falloff
+}
+if (flashLevel > 0) {
+  CRGB c1 = FLASH_SETS[flashSetIdx].s1;
+  CRGB c2 = FLASH_SETS[flashSetIdx].s2;
+  c1.nscale8_video(flashLevel);
+  c2.nscale8_video(flashLevel);
+  for (int i = 0; i < NUM_LEDS; i++) {
+    nblend(leds1[i], c1, flashLevel); // strip 1 uses set.s1
+    nblend(leds2[i], c2, flashLevel); // strip 2 uses set.s2
   }
+}
 
-  // --- LASER OUTPUT DRIVE (strobe burst stays same as your code) ---
-  bool autoLaserNow = false;
-  if (laserStrobeActive) {
-    unsigned long elapsed = millis() - laserStrobeStart;
-    if (elapsed >= LASER_STROBE_DURATION) {
-      laserStrobeActive = false;
-    } else {
-      autoLaserNow = ((elapsed / LASER_STROBE_SPEED) % 2) == 0;
-    }
-  }
-  bool laserNow = laserOn || (millis() < laserPulseUntil) || autoLaserNow || laserAutoState;
-  digitalWrite(LASER_PIN, laserNow ? HIGH : LOW);
 
-  // Effect strobe (keyboard/touch)
-  bool strobeNow = (strobeActive || strobeFromKey);
-  if (strobeNow) {
-    bool strobeOn = (((nowMs / TOUCH_STROBE_SPEED) & 1) == 0);
-    if (strobeOn) {
-      const CRGB s1 = STROBE_SETS[strobeSetIdx].s1;
-      const CRGB s2 = STROBE_SETS[strobeSetIdx].s2;
-      fill_solid(leds1, NUM_LEDS, s1);
-      fill_solid(leds2, NUM_LEDS, s2);
-    } else {
-      fill_solid(leds1, NUM_LEDS, CRGB::Black);
-      fill_solid(leds2, NUM_LEDS, CRGB::Black);
-    }
+// --- LASER OUTPUT DRIVE ---
+bool autoLaserNow = false;
+
+// Always service the strobe, regardless of mode
+if (laserStrobeActive) {
+  unsigned long elapsed = millis() - laserStrobeStart;
+  if (elapsed >= LASER_STROBE_DURATION) {
+    laserStrobeActive = false;
+  } else {
+    // Toggle on/off at strobe speed
+    autoLaserNow = ((elapsed / LASER_STROBE_SPEED) % 2) == 0;
   }
+}
 
   if (debugBands && millis() - lastBandsPrint >= BANDS_PRINT_MS) {
     lastBandsPrint = millis();
-    printBandsLine();
-    // printBandsBars();
+    printBandsLine();    // one-line numbers
+    // printBandsBars(); // uncomment if you also want ASCII bars each tick
   }
 
-  // ----- Dim LEDs when laser is toggled -----
-static uint32_t lastDimMs = millis();
-uint32_t nowMsDim = millis();
-uint32_t dt = nowMsDim - lastDimMs;
-if (dt > 40) dt = 40; // clamp for stalls
-lastDimMs = nowMsDim;
+bool laserNow = laserOn || (millis() < laserPulseUntil) || autoLaserNow || laserAutoState;
+digitalWrite(LASER_PIN, laserNow ? HIGH : LOW);
 
-if (laserDim != laserDimTarget) {
-  // how much to move this frame
-  // (0..255 over LASER_FADE_MS)
-  uint16_t step = (uint16_t)((255UL * dt) / LASER_FADE_MS);
-  if (step == 0) step = 1;
+// -- Effect (touch) strobe: toggle while held
+// -- Effect strobe: either touch OR keyboard 's' toggle
+bool strobeNow = (strobeActive /*touch*/ || strobeFromKey);
+if (strobeNow) {
+  // 50% duty: on/off every TOUCH_STROBE_SPEED ms
+  bool strobeOn = (((nowMs / TOUCH_STROBE_SPEED) & 1) == 0);
 
-  if (laserDim < laserDimTarget) {
-    laserDim = (uint8_t)min<uint16_t>(255, laserDim + step);
+  if (strobeOn) {
+    // ON frame uses selected strobe palette
+    const CRGB s1 = STROBE_SETS[strobeSetIdx].s1;
+    const CRGB s2 = STROBE_SETS[strobeSetIdx].s2;
+    fill_solid(leds1, NUM_LEDS, s1);
+    fill_solid(leds2, NUM_LEDS, s2);
   } else {
-    laserDim = (uint8_t)max<int>(0, laserDim - step);
-  }
-}
-
-// Apply dim after all overlays/strobes are drawn, unless blackout
-if (!blackoutActive) {
-  // Scale both strips by laserDim (0=black, 255=full)
-  if (laserDim < 255) {
-    nscale8_video(leds1, NUM_LEDS, laserDim);
-    nscale8_video(leds2, NUM_LEDS, laserDim);
+    // OFF frame -> force black so background can't bleed through
+    fill_solid(leds1, NUM_LEDS, CRGB::Black);
+    fill_solid(leds2, NUM_LEDS, CRGB::Black);
   }
 }
 
 
-  FastLED.show();
-}
 
+FastLED.show();
+
+
+}
 
 // ============== TOUCH / BUTTONS ==============
 void handleTouchButtons() {
@@ -992,8 +942,8 @@ void handlePotentiometer() {
   } else if (potRole == PR_CONFETTI_BRIGHT && allowA) {
     FastLED.setBrightness(mapBright(rawA));
   } else if (potRole == PR_BOUNCE_LEN && allowA) {
-    uint16_t L = (uint16_t)map(rawA, 0, 4095, 5, 250);
-    BOUNCE_LEN = constrain(L, 5, 250);
+    uint16_t L = (uint16_t)map(rawA, 0, 4095, 10, 200);
+    BOUNCE_LEN = constrain(L, 10, 200);
   } else if (potRole == PR_BOUNCE_SPEED && allowA) {
     int v = map(rawA, 0, 4095, 2, 120);
     BOUNCE_PPS = constrain(v, 2, 120);
@@ -1008,26 +958,25 @@ void handlePotentiometer() {
     }
   }
 
-// === RIGHT KNOB ===
+  // === RIGHT KNOB (always mapped by "Knob Mode", unless in Param Adjust) ===
+  // === RIGHT KNOB (default: Sensitivity %) ===
 if (allowB) {
-  if (currentMode == FX_MODE && currentEffect == FX_BOUNCE) {
-    // Right knob = speed when Bounce is active
-    int v = map(rawB, 0, 4095, 2, 120);
-    BOUNCE_PPS = constrain(v, 2, 120);
-    uiLastActivityMs = millis();
-  } else {
-    // default: Sensitivity% with commit deadband
-    if (potB_lastCommitRaw < 0) potB_lastCommitRaw = rawB;
-    if (abs(rawB - potB_lastCommitRaw) >= SENS_COMMIT_RAW) {
-      int pct = constrain(map(rawB, 0, 4095, 0, 100), 0, 100);
-      GATE_SENS_Q8 = (uint8_t)((pct * 255 + 50) / 100);
-      potB_lastCommitRaw = rawB;
-      uiLastActivityMs   = millis();
-      Serial.printf("Sensitivity=%d%% (Q8=%u)\n", pct, GATE_SENS_Q8);
-    }
+  // pickup already handled above (potB_pickupLocked)
+  if (potB_lastCommitRaw < 0) potB_lastCommitRaw = rawB;
+
+  // only update when we move a "significant" amount from the last commit
+  if (abs(rawB - potB_lastCommitRaw) >= SENS_COMMIT_RAW) {
+    // 0..4095 -> 0..100%
+    int pct = constrain(map(rawB, 0, 4095, 0, 100), 0, 100);
+    // scale 0..100% -> 0..255 (FastLED scale8 factor)
+    GATE_SENS_Q8 = (uint8_t)((pct * 255 + 50) / 100);  // rounded
+
+    potB_lastCommitRaw = rawB;   // remember where we committed from
+    uiLastActivityMs   = millis();
+    // optional: quick serial HUD
+    Serial.printf("Sensitivity=%d%% (Q8=%u)\n", pct, GATE_SENS_Q8);
   }
 }
-
 
 }
 
@@ -1111,6 +1060,7 @@ void readMSGEQ7() {
   }
 
   audioPeakN = newPeakN;
+  audioQuiet = allNearFloor;
 }
 
 
@@ -1135,6 +1085,23 @@ void fx_bounce() {
   fill_solid(leds1, NUM_LEDS, CRGB::Black);
   fill_solid(leds2, NUM_LEDS, CRGB::Black);
 
+  // --- Blend currentPal if needed (so 1–9 cross-fade in Bounce) ---
+  if (blending) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - blendStartTime;
+    if (elapsed >= blendDuration) {
+      currentPal = targetPal;
+      blending = false;
+    } else {
+      float progress = (float)elapsed / (float)blendDuration;
+      for (int i = 0; i < 16; i++) {
+        currentPal[i].r = startPal[i].r + (targetPal[i].r - startPal[i].r) * progress;
+        currentPal[i].g = startPal[i].g + (targetPal[i].g - startPal[i].g) * progress;
+        currentPal[i].b = startPal[i].b + (targetPal[i].b - startPal[i].b) * progress;
+      }
+    }
+  }
+
   // --- Time step ---
   uint32_t nowUs = micros();
   uint32_t dtUs  = nowUs - bounceLastUs;
@@ -1153,69 +1120,92 @@ void fx_bounce() {
   // Travel range so the whole block stays on-strip
   const int32_t headMax = (int32_t)(NUM_LEDS - BOUNCE_LEN) << 8;
 
-  // --- Ease profile: slower at ends, faster mid-strip ---
-  auto speedProfile = [&](int32_t pos256, int32_t headMax256) -> int32_t {
-    float x = (headMax256 > 0) ? (float)pos256 / (float)headMax256 : 0.5f; 
-    float factor = 0.35f + 0.65f * sinf(3.1415926f * x); // ~0.35..1.0
-    if (factor < 0.10f) factor = 0.10f;
-    return (int32_t)(factor * 256.0f); // Q8
-  };
-  int32_t k1_q8 = speedProfile(b1Pos256, headMax);
-  int32_t k2_q8 = speedProfile(b2Pos256, headMax);
-  dv1_256 = (int32_t)(( (int64_t)dv1_256 * k1_q8 ) >> 8);
-  dv2_256 = (int32_t)(( (int64_t)dv2_256 * k2_q8 ) >> 8);
-
   // --- Integrate with real bounce (flip direction at ends) ---
   auto stepBounce = [&](int32_t &pos, int32_t dv, bool &dirRight){
+    // move in current direction
     pos += dirRight ? dv : -dv;
+
+    // reflect if we crossed either end (preserve overshoot)
     if (pos < 0) {
-      int32_t over = -pos; pos = over; dirRight = true;
+      int32_t over = -pos;
+      pos = over;               // reflect distance back into strip
+      dirRight = true;          // now going right
     } else if (pos > headMax) {
-      int32_t over = pos - headMax; pos = headMax - over; dirRight = false;
+      int32_t over = pos - headMax;
+      pos = headMax - over;     // reflect distance back into strip
+      dirRight = false;         // now going left
     }
   };
+
   stepBounce(b1Pos256, dv1_256, b1DirRight);  // strip 1
   stepBounce(b2Pos256, dv2_256, b2DirRight);  // strip 2
 
   // Draw the segments using the current palette (only the block is lit)
   auto drawSegment = [&](CRGB *arr, int headIdx, bool forward, bool popPhase){
-    const int L = (int)BOUNCE_LEN;
-    for (int o = 0; o < L; ++o) {
-      int p = forward ? (headIdx + o) : (headIdx - o);
-      if (p < 0 || p >= NUM_LEDS) continue;
+  const int L = (int)BOUNCE_LEN;
+  for (int o = 0; o < L; ++o) {
+    int p = forward ? (headIdx + o) : (headIdx - o);
+    if (p < 0 || p >= NUM_LEDS) continue;
 
-      int dEdge = min(o, L - 1 - o);
-      float w;
-      if (dEdge >= BOUNCE_EDGE_SOFT) w = 1.0f;
-      else {
-        float t = (float)dEdge / max(1, (int)BOUNCE_EDGE_SOFT);
-        w = BOUNCE_USE_SMOOTHSTEP ? (t*t)*(3.0f - 2.0f*t) : t;
+    // --- edge feather weight (0..1), 1 in the middle, 0 at edges ---
+    // distance to nearest edge of the lit block
+    int dEdge = min(o, L - 1 - o);
+
+    float w;
+    if (dEdge >= BOUNCE_EDGE_SOFT) {
+      w = 1.0f; // center plateau
+    } else {
+      float t = (float)dEdge / max(1, (int)BOUNCE_EDGE_SOFT); // 0..1 toward interior
+      if (BOUNCE_USE_SMOOTHSTEP) {
+        // smootherstep: 3t^2 - 2t^3
+        w = (t * t) * (3.0f - 2.0f * t);
+      } else {
+        w = t; // linear feather as fallback
       }
+    }
 
-      uint8_t palIdx = (uint8_t)((o * (256 / max(1, L - 1))) + (millis() >> 2));
-      uint8_t V = scale8_video(BOUNCE_BASE_V, (uint8_t)(w * 255));
-      CRGB c = ColorFromPalette(currentPal, palIdx, V);
-      if (popPhase) { nblend(c, CRGB::White, 48); c.fadeLightBy(24); }
-      arr[p] = c;
+    // base palette color with feathered brightness
+    uint8_t palIdx = (uint8_t)((o * (256 / max(1, L - 1))) + (millis() >> 2));
+    uint8_t V = scale8_video(BOUNCE_BASE_V, (uint8_t)(w * 255));
+
+    CRGB c = ColorFromPalette(currentPal, palIdx, V);
+
+    // artful pop while jolting (kept subtle so edge still feathers)
+    if (popPhase) {
+      nblend(c, CRGB::White, 48);
+      c.fadeLightBy(24);
     }
-    if (BOUNCE_EDGE_WHITE && popPhase) {
-      int tipA = forward ? headIdx : (headIdx - L + 1);
-      int tipB = forward ? (headIdx + L - 1) : headIdx;
-      if (tipA >= 0 && tipA < NUM_LEDS) arr[tipA] = CRGB::White;
-      if (tipB >= 0 && tipB < NUM_LEDS) arr[tipB] = CRGB::White;
-    }
-  };
+
+    // write (no trail baseline is already black)
+    arr[p] = c;
+  }
+
+  // Optional white tips only during pop (kept, but they’ll sit on top of feather)
+  if (BOUNCE_EDGE_WHITE && popPhase) {
+    int tipA = forward ? headIdx : (headIdx - L + 1);
+    int tipB = forward ? (headIdx + L - 1) : headIdx;
+    if (tipA >= 0 && tipA < NUM_LEDS) arr[tipA] = CRGB::White;
+    if (tipB >= 0 && tipB < NUM_LEDS) arr[tipB] = CRGB::White;
+  }
+};
 
   int h1 = (int)(b1Pos256 >> 8);
   int h2 = (int)(b2Pos256 >> 8);
+
   bool pop1 = (nowMs < joltUntilMs1);
   bool pop2 = (nowMs < joltUntilMs2);
 
+  // Forward flag for drawing = current direction
   drawSegment(leds1, h1, /*forward*/ b1DirRight, pop1);
   drawSegment(leds2, h2, /*forward*/ b2DirRight, pop2);
   renderStaticPulses(pulses1, leds1);
   renderStaticPulses(pulses2, leds2);
+
 }
+
+
+
+
 
 
 void fx_rainbow() {
@@ -1224,6 +1214,64 @@ void fx_rainbow() {
   hue++;
   fill_rainbow(leds1, NUM_LEDS, hue, 4);
   fill_rainbow(leds2, NUM_LEDS, hue+64, 4);
+}
+
+// Format the current value of a Param into a small buffer
+static void formatParamValue(const Param* p, char* out, size_t n) {
+  if (p->type == Param::P_INT)    snprintf(out, n, "%d",  *((int*)p->ptr));
+  else if (p->type == Param::P_U8)snprintf(out, n, "%u",  *((uint8_t*)p->ptr));
+  else                            snprintf(out, n, "%.2f",*((float*)p->ptr));
+}
+
+// ============== DISPLAY ==============
+void updateDisplay() {
+  if (!displayOK) return;  // <- add this line
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.println("Visualizer");
+  display.print("Mode: ");
+  display.println(currentMode == MUSIC_MODE ? "Music" : "FX");
+  display.print("AutoPal: ");
+  display.println(autoCyclePal ? "On" : "Off");
+
+  if (currentMode == MUSIC_MODE) {
+    display.println("Effect: PaletteFlow");
+    display.print("Palette: ");
+    display.println(musicPaletteNames[musicPaletteIndex]);
+  } else {
+    display.print("Effect: ");
+    display.println(FX[currentEffect].name);
+    display.print("Palette: ");
+    display.println(musicPaletteNames[musicPaletteIndex]);
+  }
+
+  if (currentMode == MUSIC_MODE && musicPaletteIndex == DARK_PALETTE_INDEX) {
+    display.print("BassThr: ");  display.println(BASS_GATE_THRESH);
+    display.print("TreblThr: "); display.println(TREBLE_GATE_THRESH);
+  }
+
+  // --- New: clarify arrow behavior on Home ---
+  display.print("Arrows: ");
+  if (ui == UI_HOME) {
+    display.println("Palette");
+  } else {
+    display.println(ARROW_MODE_NAMES[arrowMode]);
+  }
+
+  if (arrowMode == ARROW_FLASH_COLOR) {
+  display.print("Flash: ");
+  display.println(FLASH_SETS[flashSetIdx].name);
+  }
+
+  if (arrowMode == ARROW_STROBE_COLOR) {
+  display.print("Strobe: ");
+  display.println(STROBE_SETS[strobeSetIdx].name);
+  }
+
+  display.display();
 }
 
 
@@ -1247,39 +1295,42 @@ inline float softStep(float x, float halfLen, float edge){
 }
 
 // advance + render a palette as clouds to one strip
-void renderPaletteClouds(CRGB* led, bool reverseIndex,
-                         const CRGBPalette16& pal, uint8_t baseV, Cloud* C,
-                         uint16_t t1, uint16_t t2, uint16_t t3)
+void renderPaletteClouds(CRGB* led, bool reverseIndex, const CRGBPalette16& pal, uint8_t baseV,
+                         Cloud* C)
 {
-  // time step for cloud centers (kept)
+  // time step
   uint32_t nowUs = micros();
-  static uint32_t lastUs = nowUs;
-  uint32_t dtUs  = nowUs - lastUs;
+  uint32_t dtUs  = nowUs - cloudsLastUs;
   if (dtUs > 300000) dtUs = 300000;
   float dt = dtUs / 1000000.0f;
 
-  // animate clouds (kept)
+  // animate clouds
   for (uint8_t i=0;i<CLOUD_COUNT;i++){
+    // centers drift
     C[i].center += C[i].speed * dt;
     while (C[i].center < 0)          C[i].center += NUM_LEDS;
     while (C[i].center >= NUM_LEDS)  C[i].center -= NUM_LEDS;
 
+    // subtle breathing (length modulation)
     float breath = 1.0f + CLOUD_BREATHE * sinf( (millis()*0.0015f) + (C[i].wobble*0.0003f) );
     C[i].length = fminf(CLOUD_MAX_LEN, fmaxf(CLOUD_MIN_LEN, C[i].length * breath));
   }
-  lastUs = nowUs;
+  cloudsLastUs = nowUs;
 
   // black baseline
   fill_solid(led, NUM_LEDS, CRGB::Black);
 
-  // use caller-provided phases to build color index (this is the “flow”)
+  // precompute a moving palette offset like your original flow
+  static uint16_t t1=0,t2=0,t3=0; t1+=1; t2+=2; t3+=3;
+
   for (int i=0;i<NUM_LEDS;i++){
+    // palette index like before (keeps the same “feel”)
     uint8_t idx1 = sin8(i * 2 + (t1 >> 2));
     uint8_t idx2 = sin8(i * 3 + (t2 >> 3));
     uint8_t idx3 = sin8(i * 1 + (t3 >> 4));
     uint8_t colorIndex = (idx1/3) + (idx2/3) + (idx3/3);
 
-    // soft cloud masks
+    // find max contribution from any cloud (soft masks add by max)
     float m = 0.0f;
     for (uint8_t k=0;k<CLOUD_COUNT;k++){
       float d = wrapDistF((float)i, C[k].center, (float)NUM_LEDS);
@@ -1287,64 +1338,41 @@ void renderPaletteClouds(CRGB* led, bool reverseIndex,
       float w = softStep(d, halfLen, CLOUD_EDGE);
       if (w > m) m = w;
     }
-    if (m <= 0.001f) continue;
+    if (m <= 0.001f) continue; // remains black outside clouds
 
+    // apply mask to brightness (soft edges)
     uint8_t V = (uint8_t)constrain((int)(baseV * m), 0, 255);
-    uint8_t ci = reverseIndex ? (colorIndex + 64) : colorIndex;
+    // second strip uses an offset like you had
+    uint8_t ci = reverseIndex ? colorIndex + 64 : colorIndex;
     led[ reverseIndex ? (NUM_LEDS-1-i) : i ] = ColorFromPalette(pal, ci, V);
   }
 }
 
-
 // ============== Palette blending render (MUSIC_MODE) ==============
 void fx_paletteFlow() {
+  static uint16_t t1 = 0, t2 = 0, t3 = 0;
+  t1 += 1; t2 += 2; t3 += 3;
 
-  // normalized, sensitivity-adjusted bands
-  uint8_t bassN   = sens(bandNorm[1]);
-  uint8_t midN    = sens(bandNorm[3]);
-  uint8_t trebleN = sens(bandNorm[5]);
-  uint8_t peakN   = sens(audioPeakN);
+// NEW
+uint8_t bassN   = sens(bandNorm[1]);
+uint8_t trebleN = sens(bandNorm[5]);
+uint8_t peakN   = sens(audioPeakN);
 
   // Gates (normalized) — compute ONCE
   const uint8_t BASS_GATE_N   = gateToNorm255(BASS_GATE_THRESH);
   const uint8_t TREBLE_GATE_N = gateToNorm255(TREBLE_GATE_THRESH);
 
+  // Scene level (for background feel)
+  static float sceneLevel = 0.0f;
+  float target = peakN / 255.0f;
+  float alpha  = 0.10f + 0.15f * target;
+  sceneLevel   = (1.0f - alpha) * sceneLevel + alpha * target;
+
   auto can_hit = [](unsigned long lastMs, uint16_t debounce)->bool{
     return (millis() - lastMs) > debounce;
   };
 
-    // === NEW: palette phase state (per-strip), plus music-reactive increments ===
-  static uint16_t T1a=0, T2a=0, T3a=0;   // strip 1 phases
-  static uint16_t T1b=0, T2b=0, T3b=0;   // strip 2 phases (counterflow)
-  // “quiet base” keeps a gentle drift even when silent
-  const uint8_t base1 = 1, base2 = 2, base3 = 3;
-
-  // scene energy 0..1
-  float loud = g_sceneLevel;                     // already smoothed
-  // scale to small integers for phase steps
-  uint8_t loudBoost = (uint8_t)(loud * 10.0f);   // up to ~10 extra ticks
-
-  // Band pushes (small, musical nudges)
-  uint8_t bassPush   = bassN   >> 5;  // /32
-  uint8_t midPush    = midN    >> 5;
-  uint8_t treblePush = trebleN >> 5;
-
-  // Strip 1: with the bass (R→) and mids
-  uint8_t inc1a = base1 + loudBoost + bassPush;
-  uint8_t inc2a = base2 + loudBoost + midPush;
-  uint8_t inc3a = base3 + loudBoost + (midPush >> 1);
-
-  // Strip 2: counterflow, treble-led (L←) with some mids
-  uint8_t inc1b = base1 + loudBoost + treblePush;
-  uint8_t inc2b = base2 + loudBoost + midPush;
-  uint8_t inc3b = base3 + loudBoost + (midPush >> 1);
-
-  // Advance phases (opposite directions for pleasing parallax)
-  T1a += inc1a;  T2a += inc2a;  T3a += inc3a;
-  T1b -= inc1b;  T2b -= inc2b;  T3b -= inc3b;
-
-// ----- Unified LASER auto strobe gate (all palettes) -----
-if (LASER_AUTO_ENABLED) {
+  // ===== Laser strobe gate (same) =====
   unsigned long now = millis();
   if (normTo900(peakN) >= LASER_GATE_THRESH) {
     if (!laserStrobeActive && (now - lastLaserTrigger > LASER_DEBOUNCE_MS)) {
@@ -1353,11 +1381,20 @@ if (LASER_AUTO_ENABLED) {
       lastLaserTrigger  = now;
     }
   }
-} else {
-  // If auto is off, ensure we don't keep residual strobe
-  // (manual laserOn still works via button A / 'l')
-}
 
+  // ---------- PALETTE BLEND ----------
+  if (blending) {
+    unsigned long e = millis() - blendStartTime;
+    if (e >= blendDuration) { currentPal = targetPal; blending = false; }
+    else {
+      float k = (float)e / (float)blendDuration;
+      for (int i = 0; i < 16; i++) {
+        currentPal[i].r = startPal[i].r + (targetPal[i].r - startPal[i].r) * k;
+        currentPal[i].g = startPal[i].g + (targetPal[i].g - startPal[i].g) * k;
+        currentPal[i].b = startPal[i].b + (targetPal[i].b - startPal[i].b) * k;
+      }
+    }
+  }
 
   // ============== DARK palette =========
   if (musicPaletteIndex == DARK_PALETTE_INDEX) {
@@ -1365,6 +1402,10 @@ if (LASER_AUTO_ENABLED) {
     fill_solid(leds2, NUM_LEDS, CRGB::Black);
 
     unsigned long nowMs = millis();
+    if (bassN >= BASS_GATE_N || trebleN >= TREBLE_GATE_N) {
+      musicGateOpenUntil = nowMs + MUSIC_GATE_HOLD;
+    }
+    laserAutoState = (nowMs < musicGateOpenUntil);
 
     // Energy-scaled pops (brightness + length)
     if (bassN >= BASS_GATE_N && can_hit(lastBassHitMs, BASS_HIT_DEBOUNCE)) {
@@ -1387,20 +1428,19 @@ if (LASER_AUTO_ENABLED) {
   }
 
   // -------- CLOUD / BLOCK RENDERING (non-Dark) ----------
-float curved = powf(constrain(g_sceneLevel, 0.f, 1.f), 0.8f);
-uint8_t bright = (uint8_t)(18 + (210 - 18) * curved);
-float motion = 0.6f + 1.0f * g_sceneLevel;
-motion *= (CLOUD_SPEED_SCALE / 100.0f);
-  
+  float curved = powf(constrain(sceneLevel, 0.f, 1.f), 0.8f);
+  uint8_t bright = (uint8_t)(18 + (210 - 18) * curved);
+
+  float motion = 0.6f + 1.0f * sceneLevel; // 0.6x → 1.6x
   float s1[CLOUD_COUNT], s2[CLOUD_COUNT];
   for (uint8_t i=0;i<CLOUD_COUNT;i++){ s1[i]=clouds1[i].speed; s2[i]=clouds2[i].speed;
                                        clouds1[i].speed*=motion;  clouds2[i].speed*=motion; }
-renderPaletteClouds(leds1, false, currentPal, bright, clouds1, T1a, T2a, T3a);
-renderPaletteClouds(leds2, true,  currentPal, bright, clouds2, T1b, T2b, T3b);
+  renderPaletteClouds(leds1, false, currentPal, bright, clouds1);
+  renderPaletteClouds(leds2, true,  currentPal, bright, clouds2);
   for (uint8_t i=0;i<CLOUD_COUNT;i++){ clouds1[i].speed=s1[i]; clouds2[i].speed=s2[i]; }
 
   // Subtle shimmer
-  uint8_t warpAmt = (uint8_t)(10 + 40 * g_sceneLevel);
+  uint8_t warpAmt = (uint8_t)(10 + 40 * sceneLevel);
   if (warpAmt > 0) {
     uint32_t t = millis();
     for (int i=0;i<NUM_LEDS;i++){
@@ -1425,8 +1465,8 @@ renderPaletteClouds(leds2, true,  currentPal, bright, clouds2, T1b, T2b, T3b);
   }
 
   // Quiet fade smoothing
-  if (g_sceneLevel < 0.15f) {
-    uint8_t fade = (uint8_t)map((int)(g_sceneLevel*1000), 0, 150, 20, 8);
+  if (sceneLevel < 0.15f) {
+    uint8_t fade = (uint8_t)map((int)(sceneLevel*1000), 0, 150, 20, 8);
     fadeToBlackBy(leds1, NUM_LEDS, fade);
     fadeToBlackBy(leds2, NUM_LEDS, fade);
   }
@@ -1451,6 +1491,49 @@ renderPaletteClouds(leds2, true,  currentPal, bright, clouds2, T1b, T2b, T3b);
 }
 
 
+
+
+
+
+// Background flow (time-based, non-audio)
+void renderSegmentBackground() {
+  static uint16_t t1 = 0, t2 = 0, t3 = 0;
+  t1 += 2; t2 += 3; t3 += 4; // a bit quicker than music mode
+
+  // Blend currentPal if needed
+  if (blending) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - blendStartTime;
+    if (elapsed >= blendDuration) {
+      currentPal = targetPal;
+      blending = false;
+    } else {
+      float progress = (float)elapsed / (float)blendDuration;
+      for (int i = 0; i < 16; i++) {
+        currentPal[i].r = startPal[i].r + (targetPal[i].r - startPal[i].r) * progress;
+        currentPal[i].g = startPal[i].g + (targetPal[i].g - startPal[i].g) * progress;
+        currentPal[i].b = startPal[i].b + (targetPal[i].b - startPal[i].b) * progress;
+      }
+    }
+  }
+
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint8_t idx1 = sin8(i * 3 + (t1 >> 2));
+    uint8_t idx2 = sin8(i * 2 + (t2 >> 3));
+    uint8_t idx3 = sin8(i * 1 + (t3 >> 4));
+    uint8_t colorIndex = (idx1 / 3) + (idx2 / 3) + (idx3 / 3);
+    uint8_t baseV = BRIGHTNESS; // fixed V; pot controls global brightness
+    leds1[i] = ColorFromPalette(currentPal, colorIndex, baseV);
+    leds2[NUM_LEDS - 1 - i] = ColorFromPalette(currentPal, colorIndex + 64, baseV);
+  }
+}
+
+inline int wrapDist(int a, int b) {
+  // circular shortest distance on 0..NUM_LEDS-1
+  int d = abs(a - b);
+  return min(d, NUM_LEDS - d);
+}
+
 void addRippleOverlay() {
   advanceFlicker(); // still use flicker to add motion to the mix amount
 
@@ -1464,16 +1547,14 @@ void addRippleOverlay() {
     uint8_t life = 255 - map(age, 0, RIPPLE_FADE_MS, 0, 255);
 
     // pick accent per palette + type
-    const CRGB accent = ripples[k].bass ? ACCENT[musicPaletteIndex].bass
-                                    : ACCENT[musicPaletteIndex].treble;
-
-
+    const CRGB accent = ripples[k].bass ? BASS_ACCENT[musicPaletteIndex]
+                                        : TREBLE_ACCENT[musicPaletteIndex];
 
     // slight hue bias keeps ripples distinct for bass/treble
     uint8_t bias = ripples[k].bass ? 0 : 96;
 
     for (int i = 0; i < NUM_LEDS; i++) {
-      int d = (int)wrapDistF((float)i, (float)ripples[k].center, (float)NUM_LEDS);
+      int d = wrapDist(i, ripples[k].center);
       int band = abs(d - (int)radius);
       if (band <= RIPPLE_WIDTH) {
         // ring brightness with sharper center
@@ -1511,21 +1592,19 @@ void addSegmentOverlay() {
     }
 
     // Choose accent per palette & type
-    const CRGB accent = segments[s].bass ? ACCENT[musicPaletteIndex].bass
-                                     : ACCENT[musicPaletteIndex].treble;
-
+    const CRGB accent = segments[s].bass ? BASS_ACCENT[musicPaletteIndex]
+                                         : TREBLE_ACCENT[musicPaletteIndex];
 // phases:
 bool flashPhase = age < POP_FLASH_MS_K;
 bool holdPhase  = (!flashPhase) && (age < POP_FLASH_MS_K + POP_HOLD_MS_K);
 bool fadePhase  = (!flashPhase && !holdPhase);
 
 // fade amount:
-uint8_t fadeV = 255;
+  uint8_t fadeV = 255;                         // <-- add this line
 if (fadePhase) {
-  uint16_t fAge = (uint16_t)min<uint32_t>(age - (POP_FLASH_MS_K + POP_HOLD_MS_K), POP_FADE_MS_K);
-  fadeV = 255 - map((long)fAge, 0L, (long)POP_FADE_MS_K, 0L, 255L);
+  uint32_t fAge = age - (POP_FLASH_MS_K + POP_HOLD_MS_K);
+  fadeV = 255 - map((uint16_t)min<uint32_t>(fAge, POP_FADE_MS_K), 0, POP_FADE_MS_K, 0, 255);
 }
-
 
 
     // Segment bounds
@@ -1555,11 +1634,10 @@ if (darkSelected) {
   base1 = base;
   base2 = base;
 } else {
-  const CRGB accent = segments[s].bass ? ACCENT[musicPaletteIndex].bass
-                                       : ACCENT[musicPaletteIndex].treble;
+  const CRGB accent = segments[s].bass ? BASS_ACCENT[musicPaletteIndex]
+                                       : TREBLE_ACCENT[musicPaletteIndex];
   base1 = base2 = accent;
 }
-
 
 
   // apply the pop envelope
@@ -1667,45 +1745,55 @@ void spawnSegmentStrong(int start, int len, bool isBass, uint8_t vMax) {
 
 
 void fx_segmentDJ() {
-  static uint16_t t1=0, t2=0, t3=0, u1=0, u2=0, u3=0;
-  t1 += 1; t2 += 2; t3 += 3;     // strip 1 slow forward
-  u1 -= 1; u2 -= 2; u3 -= 3;     // strip 2 slow reverse
+  // --- Blend currentPal if needed (so 1–9 cross-fade in DJ mode too) ---
+  if (blending) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - blendStartTime;
+    if (elapsed >= blendDuration) {
+      currentPal = targetPal;
+      blending = false;
+    } else {
+      float progress = (float)elapsed / (float)blendDuration;
+      for (int i = 0; i < 16; i++) {
+        currentPal[i].r = startPal[i].r + (targetPal[i].r - startPal[i].r) * progress;
+        currentPal[i].g = startPal[i].g + (targetPal[i].g - startPal[i].g) * progress;
+        currentPal[i].b = startPal[i].b + (targetPal[i].b - startPal[i].b) * progress;
+      }
+    }
+  }
 
+  // --- Cloud/block baseline (non-audio) ---
+  // Use fixed base brightness; your pot still sets global FastLED brightness.
   const uint8_t baseV = BRIGHTNESS;
-  renderPaletteClouds(leds1, /*reverseIndex=*/false, currentPal, baseV, clouds1, t1, t2, t3);
-  renderPaletteClouds(leds2, /*reverseIndex=*/true,  currentPal, baseV, clouds2, u1, u2, u3);
+  renderPaletteClouds(leds1, /*reverseIndex=*/false, currentPal, baseV, clouds1);
+  renderPaletteClouds(leds2, /*reverseIndex=*/true,  currentPal, baseV, clouds2);
 
+  // --- Overlays from active segments (pop envelope) ---
   addSegmentOverlay();
+  // If you want the ripples too, uncomment:
   addRippleOverlay();
 }
 
 
-// 1-arg wrapper (keeps existing call sites working)
-inline void setMusicPalette(uint8_t idx) {
-  setMusicPalette(idx, PALETTE_BLEND_MS_DEFAULT, false);
-}
-
-// main implementation
-void setMusicPalette(uint8_t idx, uint16_t ms, bool instant) {
+// ============== INPUT / KEY HANDLING ==============
+void setMusicPalette(uint8_t idx) {
   if (idx >= MUSIC_PALETTE_COUNT) return;
-
-  targetPal         = musicPalettes[idx];
+  startPal       = currentPal;
+  targetPal      = musicPalettes[idx];
+  blendStartTime = millis();
+  blending       = true;
   musicPaletteIndex = idx;
 
-  // Hard-cut the "Dark" palette (or when requested)
-  if (instant || ms == 0 || idx == DARK_PALETTE_INDEX) {
-    palBlendMs   = 0;
-    currentPal   = targetPal;
-  } else {
-    palBlendMs   = ms;
-    palBlendLast = millis();   // start timing from now
+  // If leaving Dark, drop auto laser drive immediately
+  if (musicPaletteIndex != DARK_PALETTE_INDEX) {
+    laserAutoState = false;
+    musicGateOpenUntil = 0;
   }
 
-  Serial.print("Palette -> "); Serial.println(musicPaletteNames[musicPaletteIndex]);
-  drawHome();
+  Serial.print("Palette -> ");
+  Serial.println(musicPaletteNames[musicPaletteIndex]);
+  updateDisplay();
 }
-
-
 
 
 void handleInputs() {
@@ -1734,7 +1822,7 @@ if (c == 'C' || c == 'D') {
   }
   Serial.print("Arrows -> ");
   Serial.println(ARROW_MODE_NAMES[arrowMode]);
-  drawHome();
+  updateDisplay();
   escState = ESC_IDLE;
   continue;
 }
@@ -1791,7 +1879,7 @@ if (c == 'C' || c == 'D') {
             // ignore other modes while pots/buttons are disabled
             break;
         }
-        drawHome();
+        updateDisplay();
         escState = ESC_IDLE;
         continue;
       } else {
@@ -1808,7 +1896,7 @@ if (c == 'C' || c == 'D') {
       nextPaletteCycle = millis() + PALETTE_CYCLE_MS;
       Serial.printf("Auto palette cycle %s (every %lus)\n",
                     autoCyclePal ? "ON" : "OFF", PALETTE_CYCLE_MS/1000);
-      drawHome();
+      updateDisplay();
       continue;
     }
 
@@ -1856,10 +1944,10 @@ if (c == 'C' || c == 'D') {
     }
 
     // ---- Explicit FX keys ----
-    if (c == 'q' || c == 'Q') { currentMode = FX_MODE; currentEffect = FX_CONFETTI;  Serial.println("Effect -> Confetti"); drawHome(); continue; }
-    if (c == 'w' || c == 'W') { currentMode = FX_MODE; currentEffect = FX_BOUNCE;    Serial.println("Effect -> Bounce");   drawHome(); continue; }
-    if (c == 'r' || c == 'R') { currentMode = FX_MODE; currentEffect = FX_RAINBOW;   Serial.println("Effect -> Rainbow");  drawHome(); continue; }
-    if (c == 'e' || c == 'E') { currentMode = FX_MODE; currentEffect = FX_SEGMENT_DJ;Serial.println("Effect -> DJ Segments"); drawHome(); continue; }
+    if (c == 'q' || c == 'Q') { currentMode = FX_MODE; currentEffect = FX_CONFETTI;  Serial.println("Effect -> Confetti"); updateDisplay(); continue; }
+    if (c == 'w' || c == 'W') { currentMode = FX_MODE; currentEffect = FX_BOUNCE;    Serial.println("Effect -> Bounce");   updateDisplay(); continue; }
+    if (c == 'r' || c == 'R') { currentMode = FX_MODE; currentEffect = FX_RAINBOW;   Serial.println("Effect -> Rainbow");  updateDisplay(); continue; }
+    if (c == 'e' || c == 'E') { currentMode = FX_MODE; currentEffect = FX_SEGMENT_DJ;Serial.println("Effect -> DJ Segments"); updateDisplay(); continue; }
 
     // ---- Live taps only when DJ Segments is active ----
     if (currentMode == FX_MODE && currentEffect == FX_SEGMENT_DJ) {
@@ -1871,8 +1959,8 @@ if (c == 'C' || c == 'D') {
     if (c == 'f' || c == 'F') { flashPulseUntil = millis() + FLASH_PULSE_MS; continue; }
 
     // ---- FX next/prev ----
-    if (c == 'P') { currentEffect = (currentEffect + FX_COUNT - 1) % FX_COUNT; currentMode = FX_MODE; drawHome(); continue; }
-    if (c == 'N') { currentEffect = (currentEffect + 1) % FX_COUNT;            currentMode = FX_MODE; drawHome(); continue; }
+    if (c == 'P') { currentEffect = (currentEffect + FX_COUNT - 1) % FX_COUNT; currentMode = FX_MODE; updateDisplay(); continue; }
+    if (c == 'N') { currentEffect = (currentEffect + 1) % FX_COUNT;            currentMode = FX_MODE; updateDisplay(); continue; }
 
     // ---- Bounce jolt ----
     if ((c == 'k' || c == 'K') && currentMode == FX_MODE && currentEffect == FX_BOUNCE) {
@@ -1894,7 +1982,7 @@ if (c == 'C' || c == 'D') {
     if ((c == 'm' || c == 'M') &&
         currentMode == FX_MODE &&
         (currentEffect == FX_SEGMENT_DJ || currentEffect == FX_BOUNCE)) {
-      currentMode = MUSIC_MODE; Serial.println("Mode -> Music (keeping current palette)"); drawHome(); continue;
+      currentMode = MUSIC_MODE; Serial.println("Mode -> Music (keeping current palette)"); updateDisplay(); continue;
     }
 
     // ---- Direct gate nudges (b/B, t/T) ----
@@ -1905,12 +1993,16 @@ if (c == 'C' || c == 'D') {
 
     // ---- Lasers ----
     if (c == 'l' || c == 'L') {
-  if (c == 'L') { /* strobe burst handled elsewhere */ continue; }
-  setLaserLatched(!laserOn);
-  continue;
-}
-
-
+      unsigned long now = millis();
+      if (c == 'L') {
+        if (!laserStrobeActive && (now - lastLaserTrigger > LASER_DEBOUNCE_MS)) {
+          laserStrobeActive = true; laserStrobeStart = now; lastLaserTrigger = now;
+          Serial.println("Laser STROBE burst"); updateDisplay();
+        }
+        continue;
+      }
+      laserOn = !laserOn; Serial.printf("Laser %s\n", laserOn ? "ON" : "OFF"); updateDisplay(); continue;
+    }
 
     // ---- Rotate arrow target: 'p' (cycle Music → Bass → Treble → Laser) ----
 if (c == 'p' || c == 'P') {
@@ -1920,7 +2012,7 @@ if (c == 'p' || c == 'P') {
   else                                      arrowMode = ARROW_MUSIC_GATE;   // wrap to start
   Serial.print("Arrows -> ");
   Serial.println(ARROW_MODE_NAMES[arrowMode]);
-  drawHome();
+  updateDisplay();
   continue;
 }
 
@@ -1932,13 +2024,83 @@ if (c == 'p' || c == 'P') {
       TREBLE_GATE_THRESH = DEFAULT_TREBLE_GATE;
       FastLED.setBrightness(DEFAULT_BRIGHTNESS);
       Serial.println("Restored defaults: flash color, gates, brightness.");
-      drawHome();
+      updateDisplay();
       continue;
     }
-
   }
 }
 
+
+
+// Renders active "segments[]" using PartyColors_p with flash/hold/fade envelope.
+// Baseline is black — only the segments are shown.
+void addPartySegmentOverlay_MusicDark() {
+  unsigned long now = millis();
+  for (uint8_t s = 0; s < MAX_SEGMENTS; s++) {
+    if (!segments[s].active) continue;
+
+    uint32_t age = now - segments[s].startMs;
+    if (age > (POP_FLASH_MS + POP_HOLD_MS + POP_FADE_MS)) {
+      segments[s].active = false;
+      continue;
+    }
+
+    bool flashPhase = age < POP_FLASH_MS;
+    bool holdPhase  = (!flashPhase) && (age < POP_FLASH_MS + POP_HOLD_MS);
+    bool fadePhase  = (!flashPhase && !holdPhase);
+
+    uint8_t fadeV = 255;
+    if (fadePhase) {
+      uint32_t fAge = age - (POP_FLASH_MS + POP_HOLD_MS);
+      fadeV = 255 - map((uint16_t)min<uint32_t>(fAge, POP_FADE_MS), 0, POP_FADE_MS, 0, 255);
+    }
+
+    // Different lane per bass/treble so repeated hits don’t look identical
+    uint8_t laneBias = segments[s].bass ? 24 : 160;
+
+    int segLen = max(0, segments[s].length);
+    for (int o = 0; o < segLen; o++) {
+  int p1 = (segments[s].start + o) % NUM_LEDS;
+  int p2 = (NUM_LEDS - 1) - p1;
+
+  // Palette index with mild texture; separate per strip for variety
+  uint8_t jitter   = ((p1 * 7) + (age >> 2)) & 0x1F;
+  uint8_t palIdx1  = ((p1 * 2) + jitter) & 0xFF;       // strip 1
+  uint8_t palIdx2  = ((p2 * 2) + jitter + 64) & 0xFF;  // strip 2, offset
+
+  // --- PICK COLOR BY STRIP (not by segment type) ---
+  CRGB base1 = ColorFromPalette(PALETTE_DARK_BASS,   palIdx1, 255);  // strip 1 = Indigo
+  CRGB base2 = ColorFromPalette(PALETTE_DARK_TREBLE, palIdx2, 255);  // strip 2 = Red
+
+  // Envelope
+  auto applyEnv = [&](CRGB c)->CRGB {
+    if (flashPhase) { nblend(c, CRGB::White, 80); return c; }
+    if (holdPhase)  { return c; }
+    c.nscale8_video(fadeV);
+    return c;
+  };
+
+  CRGB c1 = applyEnv(base1);
+  CRGB c2 = applyEnv(base2);
+
+  // Optional white tips while flashing/holding
+  if (POP_EDGE_WHITE && (flashPhase || holdPhase) && (o == 0 || o == segLen - 1)) {
+    c1 = CRGB::White;
+    c2 = CRGB::White;
+  }
+
+  // Write: overwrite on flash/hold; blend on fade
+  if (flashPhase || holdPhase) {
+    leds1[p1] = c1;
+    leds2[p2] = c2;
+  } else {
+    nblend(leds1[p1], c1, 200);
+    nblend(leds2[p2], c2, 200);
+  }
+}
+
+  }
+}
 
 void spawnStaticPulse(bool onStrip1, int headIdx, bool dirRight) {
   StaticPulse* arr = onStrip1 ? pulses1 : pulses2;
@@ -2006,15 +2168,35 @@ void renderStaticPulses(StaticPulse* arr, CRGB* strip) {
 
 // --- A: Palettes/Flash ---
 int blendMsDefault = 250;
+Param A_Palette    = {"Palette", &musicPaletteIndex, Param::P_U8, 0, (int)MUSIC_PALETTE_COUNT-1, 0, 0, 1, 1};
+Param A_BlendMs    = {"BlendMs", &blendDuration,     Param::P_INT, 60, 4000, 250, 0, 100, 10};
+Param A_FlashSet   = {"FlashSet",&flashSetIdx,       Param::P_U8, 0, (int)FLASH_SET_COUNT-1, 0, 0, 1, 1};
+
+// --- B: Gates ---
+Param B_MusicGate  = {"MusicGate",  &MUSIC_GATE_THRESH,  Param::P_INT, 0, 900, DEFAULT_MUSIC_GATE, 0, 10, 2};
+Param B_BassGate   = {"BassGate",   &BASS_GATE_THRESH,   Param::P_INT, 0, 900, DEFAULT_BASS_GATE,  0, 10, 2};
+Param B_TrebleGate = {"TrebleGate", &TREBLE_GATE_THRESH, Param::P_INT, 0, 900, DEFAULT_TREBLE_GATE,0, 10, 2};
+Param B_Sensitivity = { "Sensitivity%", &GATE_SENS_Q8, Param::P_U8, 40, 255, 170, 0, 5, 1 };
+
+// --- C: FX/Music feel ---
+Param C_BouncePps  = {"BouncePPS",  (void*)&BOUNCE_PPS,   Param::P_INT, 2, 120, 10, 0, 2, 1};
+Param C_BounceLen  = {"BounceLen",  (void*)&BOUNCE_LEN,   Param::P_INT, 10, 200, 50, 0, 2, 1};
+Param C_JoltPps    = {"JoltPPS",    (void*)&BOUNCE_JOLT_PPS, Param::P_INT, 20, 240, 60, 0, 5, 2};
 
 // These three are “virtual” knobs that scale existing behaviors:
 uint8_t CLOUD_EDGE_SOFT_KNOB = 50;      // maps to CLOUD_EDGE/softness factor
 uint8_t CLOUD_SPEED_SCALE    = 100;     // 100% = unchanged
 uint8_t SPARKLE_INTENSITY    = 50;      // 0..100 → maps to prob cap
-
+Param C_CloudSpeed = {"CloudSpeed%", &CLOUD_SPEED_SCALE,   Param::P_U8, 30, 200, 100, 0, 5, 1};
+Param C_CloudEdge  = {"CloudEdge%",  &CLOUD_EDGE_SOFT_KNOB,Param::P_U8, 10, 200,  100, 0, 5, 1};
+Param C_Sparkle    = {"Sparkle%",    &SPARKLE_INTENSITY,   Param::P_U8,  0, 100,   40, 0, 5, 1};
 
 // --- D: Overlays/Strobe/Lasers ---
 uint16_t POP_FLASH_MS_K = POP_FLASH_MS, POP_HOLD_MS_K = POP_HOLD_MS, POP_FADE_MS_K = POP_FADE_MS;
+Param D_PopMacro  = {"PopMacro",  &POP_FLASH_MS_K,  Param::P_INT, 20, 160, POP_FLASH_MS, 0, 5, 1}; // macro will set all three
+Param D_StrobeSpd = {"StrobeMs", (void*)&TOUCH_STROBE_SPEED,
+                     Param::P_U8, 20, 200, TOUCH_STROBE_SPEED, 0, 5, 1};
+Param D_LaserGate = {"LaserGate", &LASER_GATE_THRESH, Param::P_INT, 100, 900, LASER_GATE_THRESH, 0, 10, 2};
 
 
 static void initButtons() {
@@ -2062,7 +2244,36 @@ int readPotFiltered(uint8_t pin, int &lastRaw, int dead) {
   return raw;
 }
 
+void applyParamDelta(const Param* p, bool fine, int deltaSign) {
+  int step = fine ? p->stepFine : p->stepCoarse;
 
+  if (p->type == Param::P_INT) {
+    int v = *((int*)p->ptr);
+    v = constrain(v + deltaSign * step, p->iMin, p->iMax);
+    *((int*)p->ptr) = v;
+     if (p == &A_Palette) {
+      setMusicPalette((uint8_t)v);
+    }
+  } else if (p->type == Param::P_U8) {
+    int v = *((uint8_t*)p->ptr);
+    v = constrain(v + deltaSign * step, p->iMin, p->iMax);
+    *((uint8_t*)p->ptr) = (uint8_t)v;
+     if (p == &A_Palette) {
+      setMusicPalette((uint8_t)v);
+    }
+  } else {
+    float v = *((float*)p->ptr);
+    float fstep = (float)step;
+    v = fminf(p->fMax, fmaxf(p->fMin, v + deltaSign * fstep));
+    *((float*)p->ptr) = v;
+     if (p == &A_Palette) {
+      setMusicPalette((uint8_t)v);
+    }
+  }
+}
+
+
+// ==== QUICK I/O MONITOR (press 'Z') ====
 // ==== QUICK I/O MONITOR (press 'Z') ====
 void dumpIOOnce() {
   int raw = analogRead(POT1_PIN);
@@ -2075,7 +2286,7 @@ void dumpIOOnce() {
 }
 
 
-void drawHome() {
+static void drawHome() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -2092,6 +2303,12 @@ void drawHome() {
     display.println(FX[currentEffect].name);
   }
 
+  display.println();
+display.println("E/G:Palette  H:Settings");
+display.println("A:Laser  B/C/D:FX");
+
+display.print("Knobs: ");
+display.println(potMode == PM_BRIGHT_MUSIC ? "Bright+Music" : "Bass+Treble");
 display.print("Gate M/B/T: ");
 display.print(MUSIC_GATE_THRESH); display.print("/");
 display.print(BASS_GATE_THRESH);  display.print("/");
@@ -2105,10 +2322,6 @@ display.println((unsigned)((uint16_t)GATE_SENS_Q8*100/255));
 
   display.print("Laser: ");
   display.println(laserOn ? "ON" : "OFF");
-  // In drawHome(), after "Laser: ON/OFF"
-display.print("LaserAuto: ");
-display.println(LASER_AUTO_ENABLED ? "ON" : "OFF");
-
 
   display.println();
   display.println("H:Settings  A:Laser  B/C/D:FX");
@@ -2119,39 +2332,26 @@ display.println(potMode == PM_BRIGHT_MUSIC ? "Bright+Music" : "Bass+Treble");
 }
 
 static void drawSettingsRoot() {
-const char* items[SI_COUNT] = {
-  "Music", "Palette Color", "Flash Color", "Knob Mode",
-  "Laser Auto", "Laser Gate"
-};
+  const char* items[SI_COUNT] = {"Music", "Palette Color", "Flash Color", "Knob Mode"};
 
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("Settings");
 
-display.clearDisplay();
-display.setTextSize(1);
-display.setTextColor(SSD1306_WHITE);
-display.setCursor(0,0);
-display.println("Settings");
-
-for (uint8_t i=0;i<SI_COUNT;i++){
-  if (i==menuCursor) display.print("> "); else display.print("  ");
-  if (i == SI_KNOBMODE) {
-    display.print(items[i]); display.print(": ");
-    display.println(potMode == PM_BRIGHT_MUSIC ? "Bright+Music" : "Bass+Treble");
-  } else if (i == SI_LASER_AUTO) {
-    display.print(items[i]); display.print(": ");
-    display.println(LASER_AUTO_ENABLED ? "ON" : "OFF");
-  } else if (i == SI_LASER_GATE) {
-    display.print(items[i]); display.print(": ");
-    display.println(LASER_GATE_THRESH);
-  } else {
-    display.println(items[i]);
+  for (uint8_t i=0;i<SI_COUNT;i++){
+    if (i==menuCursor) display.print("> "); else display.print("  ");
+    if (i == SI_KNOBMODE) {
+      display.print(items[i]); display.print(": ");
+      display.println(potMode == PM_BRIGHT_MUSIC ? "Bright+Music" : "Bass+Treble");
+    } else {
+      display.println(items[i]);
+    }
   }
-}
-
-
-
-display.setCursor(0,56);
-display.print("E/G:Up/Down  F:Enter  H:Back");
-display.display();
+  display.setCursor(0,56);
+  display.print("E/G:Up/Down  F:Enter  H:Back");
+  display.display();
 }
 
 
@@ -2217,11 +2417,6 @@ static void enterParamAdjust(ParamTarget pt) {
     case PT_TREBLE:     snprintf(value,sizeof(value),"TrebleGate=%d",TREBLE_GATE_THRESH);break;
     case PT_PALETTE:    snprintf(value,sizeof(value),"Palette=%s",   musicPaletteNames[musicPaletteIndex]); break;
     case PT_FLASHSET:   snprintf(value,sizeof(value),"Flash=%s",     FLASH_SETS[flashSetIdx].name); break;
-    case PT_LASER_GATE:
-  snprintf(value,sizeof(value),"LaserGate=%d", LASER_GATE_THRESH);
-  drawParamAdjust("Laser Gate", "Turn knob, F:Apply, H:Back", value);
-  return;
-
 
     case PT_SENSITIVITY: {
       char pct[8];
@@ -2339,18 +2534,7 @@ static void tickParamAdjust() {
       snprintf(buf, sizeof(buf), "Sensitivity=%u%%", pct);
       drawParamAdjust("Sensitivity", "Turn knob, F:Apply, H:Back", buf);
     }
-  } else if (activeParam == PT_LASER_GATE) {
-  int mapped = map(raw, 0, 4095, 0, 900);
-  mapped = constrain(mapped, 0, 900);
-  if (mapped != LASER_GATE_THRESH) {
-    LASER_GATE_THRESH = mapped;
-    uiLastActivityMs = millis();
-    char buf[32];
-    snprintf(buf, sizeof(buf), "LaserGate=%d", LASER_GATE_THRESH);
-    drawParamAdjust("Laser Gate", "Turn knob, F:Apply, H:Back", buf);
   }
-}
-
 }
 
 
@@ -2372,31 +2556,20 @@ static void tickSettingsRoot() {
 
   if (BTN[BI_F].fellEdge) {
   uiLastActivityMs = millis();
-if (menuCursor == SI_MUSIC) {
-  ui = UI_SETTINGS_MUSIC; musicCursor=0; drawSettingsMusic();
-
-} else if (menuCursor == SI_PALETTE) {
-  enterParamAdjust(PT_PALETTE);
-
-} else if (menuCursor == SI_FLASH) {
-  enterParamAdjust(PT_FLASHSET);
-
-} else if (menuCursor == SI_KNOBMODE) {
-  potMode = (potMode == PM_BRIGHT_MUSIC) ? PM_BASS_TREBLE : PM_BRIGHT_MUSIC;
-  potA_pickupLocked = potB_pickupLocked = true;
-  potA_entryRaw = potB_entryRaw = -1;
-  Serial.printf("KnobMode -> %s\n", potMode==PM_BRIGHT_MUSIC ? "Bright+Music" : "Bass+Treble");
-  drawSettingsRoot();
-
-} else if (menuCursor == SI_LASER_AUTO) {
-  LASER_AUTO_ENABLED = !LASER_AUTO_ENABLED;
-  Serial.printf("Laser Auto -> %s\n", LASER_AUTO_ENABLED ? "ON" : "OFF");
-  drawSettingsRoot();
-
-} else if (menuCursor == SI_LASER_GATE) {
-  enterParamAdjust(PT_LASER_GATE);
-}
-
+  if (menuCursor == SI_MUSIC) {
+    ui = UI_SETTINGS_MUSIC; musicCursor=0; drawSettingsMusic();
+  } else if (menuCursor == SI_PALETTE) {
+    enterParamAdjust(PT_PALETTE);
+  } else if (menuCursor == SI_FLASH) {
+    enterParamAdjust(PT_FLASHSET);
+  } else if (menuCursor == SI_KNOBMODE) {
+    potMode = (potMode == PM_BRIGHT_MUSIC) ? PM_BASS_TREBLE : PM_BRIGHT_MUSIC;
+    // reset pickup so the new mapping doesn't jump
+    potA_pickupLocked = potB_pickupLocked = true;
+    potA_entryRaw = potB_entryRaw = -1;
+    Serial.printf("KnobMode -> %s\n", potMode==PM_BRIGHT_MUSIC ? "Bright+Music" : "Bass+Treble");
+    drawSettingsRoot();
+  }
 }
 }
 
@@ -2439,10 +2612,18 @@ static void tickHome() {
     return;
   }
 
+  // Laser toggle (A)
+  if (BTN[BI_A].fellEdge) {
+    laserOn = !laserOn;
+    updateDisplay();
+    drawHome();
+    uiLastActivityMs = millis();
+  }
+
   // FX selects (B/C/D)
-  if (BTN[BI_B].fellEdge) { currentMode = FX_MODE; currentEffect = FX_CONFETTI;  drawHome(); drawHome(); uiLastActivityMs=millis(); }
-  if (BTN[BI_C].fellEdge) { currentMode = FX_MODE; currentEffect = FX_BOUNCE;    drawHome(); drawHome(); uiLastActivityMs=millis(); }
-  if (BTN[BI_D].fellEdge) { currentMode = FX_MODE; currentEffect = FX_SEGMENT_DJ;drawHome(); drawHome(); uiLastActivityMs=millis(); }
+  if (BTN[BI_B].fellEdge) { currentMode = FX_MODE; currentEffect = FX_CONFETTI;  updateDisplay(); drawHome(); uiLastActivityMs=millis(); }
+  if (BTN[BI_C].fellEdge) { currentMode = FX_MODE; currentEffect = FX_BOUNCE;    updateDisplay(); drawHome(); uiLastActivityMs=millis(); }
+  if (BTN[BI_D].fellEdge) { currentMode = FX_MODE; currentEffect = FX_SEGMENT_DJ;updateDisplay(); drawHome(); uiLastActivityMs=millis(); }
 
   // F enters FX tweak when in FX mode
   if (BTN[BI_F].fellEdge && currentMode == FX_MODE) {
@@ -2495,9 +2676,7 @@ void initNewUI() {
 // CALL THIS EACH FRAME in loop()
 void uiTick() {
   scanButtons();
-if (BTN[BI_A].fellEdge) {
-  setLaserLatched(!laserOn);
-}
+
 
   // 6s inactivity (no button edges & no committed pot changes)
   if ((millis() - uiLastActivityMs) > UI_IDLE_MS && ui != UI_HOME) {

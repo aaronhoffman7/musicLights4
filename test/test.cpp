@@ -1,742 +1,205 @@
 #include <Arduino.h>
-#include <FastLED.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <Wire.h>
 
-TaskHandle_t displayTaskHandle;
-void displayTask(void* parameter);
+// ---------- OLED ----------
+static const int I2C_SDA = 21;
+static const int I2C_SCL = 22;
+#define OLED_WIDTH   128
+#define OLED_HEIGHT   64
+static const uint8_t TRY_ADDRS[] = {0x3C, 0x3D};
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 
-
-// === Function Prototypes ===
-void readMSGEQ7();
-void updateDynamicMaxBand();
-void cyclePalettes();
-void printBandsForPlotter();
-void updateDynamicMaxTreble();
-void updatePaletteBlend();
-void updateBassBrightnessOverlay();
-void initializeScreen();
-void updateDisplay();
-void handleButton();
-void handlePotentiometer();
-
-// === Constants and Globals ===  
-
-// screen
-#define SCREEN_I2C_ADDR 0x3C // or 0x3C
-#define SCREEN_WIDTH 128     // OLED display width, in pixels
-#define SCREEN_HEIGHT 64     // OLED display height, in pixels
-#define OLED_RST_PIN -1      // Reset pin (-1 if not available)
-// Create display object
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-#define POT_PIN 23
-#define BUTTON_PIN 15
-int touchThreshold = 40;  // Adjust depending on your setup
-
-// msgeq7
+// ---------- MSGEQ7 (your same pins) ----------
 #define STROBE_PIN 12
-#define RESET_PIN 13
-#define ANALOG_PIN 36
+#define RESET_PIN  13
+#define ANALOG_PIN 36  // ESP32 ADC1_CH0  (good choice)
 
-// LED strips
-#define DATA_PIN_1 25
-#define DATA_PIN_2 26
-#define NUM_LEDS 50
-#define CHIPSET WS2811
-#define COLOR_ORDER RGB
-#define BRIGHTNESS 170
+// ---------- Options ----------
+#define SERIAL_DEBUG true
 
-#define STROBE_DURATION 1300       // milliseconds
-#define STROBE_FLASH_SPEED 45      // milliseconds
-#define FLASH_DURATION 300         // milliseconds
+// 0..900 scale (matches your big project)
+static float smooth900[7] = {0,0,0,0,0,0,0};
+static const float EMA = 0.35f;  // smoothing strength
 
-// music variables
-const int noiseFloor = 45;
-int maxTrebleValue = 0;  // variable
-unsigned long lastTrebleTrigger = 0;
-unsigned long lastBassHit = 0;
-const int paletteCycleDuration = 10000;
-int selectedBand1 = 1; // LED strip 1 (bass)
-int selectedBand2 = 5; // LED strip 2 (bass)
+// ===== util: I2C scan (optional, but handy) =====
+uint8_t scanI2C() {
+  uint8_t found = 0;
+  Serial.println("\nI2C scan...");
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("  Found device at 0x%02X\n", addr);
+      if (!found) found = addr;
+    }
+    delay(2);
+  }
+  if (!found) Serial.println("  No I2C devices found.");
+  return found;
+}
 
-const int maxBassBrightness = 140;   // Higher maximum for bass hits
-const int maxTrebleBrightness = 220; // Higher maximum for treble hits
-const int baseBrightness = 25; // very dim 
-const int trebleDensity = 4; // treble shows on every nth light on the strip 
-const int trebleBlend = 200; // n/255 ratio of how much treble overly blends with bass base
+// ===== OLED helpers =====
+bool beginOLED() {
+  uint8_t first = scanI2C();
+  bool ok = false; uint8_t used = 0;
 
-float maxBandValue2 = 650;  // Upper clamp for bass band value
-int burstLength = 4;            // number of LEDs to light up (1 on either side of center)
-const unsigned long trebleCooldown = 60;  // minimum gap between treble triggers (ms)
-const uint8_t trebleHitIntensity = 255;     // more subtle brightness
-const float bassThresholdFactor = 0.45; //percentage of max band value that's considered within threshold
-const float trebleThresholdFactor = 0.3; //
+  if (first) {
+    ok = display.begin(SSD1306_SWITCHCAPVCC, first);
+    used = first;
+  }
+  for (uint8_t a : TRY_ADDRS) {
+    if (!ok && a != first) {
+      ok = display.begin(SSD1306_SWITCHCAPVCC, a);
+      if (ok) used = a;
+    }
+  }
+  if (ok) {
+    Serial.printf("SSD1306 init OK at 0x%02X\n", used);
+  }
+  return ok;
+}
 
-int bassDeltaThreshold = 100;  // min gap between bass triggers (ms)
-int trebleDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
-int trebleDecayRaw = 1; // x / 1023
-int bassDecayMS = 150; //every n milliseconds, max treble reader is decaying x / 1023 
-int bassDecayRaw = 1; // x / 1023
-int bassSegmentJump = 2;
+void drawBanner(const char* sub) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0,0);
+  display.println("MSGEQ7");
+  display.setTextSize(1);
+  display.setCursor(0,22);
+  display.println(sub);
+  display.display();
+}
 
-const unsigned long bassFadeDuration = 800;  // Fade back to base in 2.5 sec
-#define TREBLE_HISTORY 75  // number of past readings to average
+// ===== MSGEQ7 read =====
+// Returns values in out[7] on a 0..900 scale.
+void readMSGEQ7_900(int out[7]) {
+  // Flush ADC channel switch noise (ESP32 quirk)
+  (void)analogRead(ANALOG_PIN);
+  delayMicroseconds(5);
+  (void)analogRead(ANALOG_PIN);
+  delayMicroseconds(5);
 
-#define NUM_SETTINGS 6        // Number of tunable variables
+  // Reset sequence per datasheet
+  digitalWrite(STROBE_PIN, HIGH);
+  digitalWrite(RESET_PIN,  HIGH); delayMicroseconds(5);
+  digitalWrite(RESET_PIN,  LOW);  delayMicroseconds(5);
 
-// === Tunable Variable Array ===
-int* tunableVars[NUM_SETTINGS] = {
-  &bassDeltaThreshold,
-  &trebleDecayMS,
-  &trebleDecayRaw,
-  &bassDecayMS,
-  &bassDecayRaw,
-  &bassSegmentJump
-};
+  for (int i = 0; i < 7; i++) {
+    digitalWrite(STROBE_PIN, LOW);
+    delayMicroseconds(30);          // allow filter to settle
 
-const char* settingNames[NUM_SETTINGS] = {
-  "Bass Delta",
-  "Treble Decay ms",
-  "Treble Decay Raw",
-  "Bass Decay ms",
-  "Bass Decay Raw",
-  "Bass Segment Jump"
-};
+    (void)analogRead(ANALOG_PIN);   // throw away first read after mux
+    int raw = analogRead(ANALOG_PIN);
 
-int settingMin[NUM_SETTINGS] = { 10, 10, 1, 10, 1, 1 };
-int settingMax[NUM_SETTINGS] = { 300, 1000, 15, 1000, 15, 8 };
+    digitalWrite(STROBE_PIN, HIGH); // latch next band
+    delayMicroseconds(36);
 
-int currentSettingIndex = 0;
-unsigned long lastDebounceTime = 0;
-unsigned long debounceDelay = 250;
-bool lastButtonState = HIGH;
+    // Map ESP32 12-bit ADC (0..4095) to your traditional 0..900 scale
+    int v900 = map(raw, 0, 4095, 0, 900);
+    out[i] = constrain(v900, 0, 900);
+  }
+}
 
+// ===== Render a 7-band bar graph =====
+void drawBands(const int v[7]) {
+  // Layout: 7 columns across width, labels at bottom
+  const int left   = 0;
+  const int top    = 0;
+  const int width  = OLED_WIDTH;
+  const int height = OLED_HEIGHT;
 
-// don't change
-CRGB trebleBursts[NUM_LEDS];     // stores active burst overlays
-const uint8_t trebleFadeSpeed = 2;  // lower = slower fade, try 1–3
-int maxBandValue = 0; // max bass
-int trebleBurstPos = 0;      // Current position of treble burst center
-int trebleBurstDir = 1;      // +1 = right, -1 = left (bouncing direction)
-unsigned long bassFadeStart = 0;
-static int bassLitStart = 0;
-static int bassLitLength = 10;
-static int bassMoveDir = 1; // 1 = right, -1 = left
-CRGB bassSparkles[NUM_LEDS];  // stores red flicker state
-uint8_t sparkleFlicker[NUM_LEDS] = {0};
-uint8_t bassBrightnessOverlay[NUM_LEDS] = {0};
-uint8_t currentBassBrightness = baseBrightness;
-uint8_t targetBassBrightness = baseBrightness;
-const int paletteBlendSpeed = 1;
-int trebleOverlayPos = 0;           // Start position for the segment
-const int segmentLength = 6;  // Number of LEDs in the segment
-int trebleSegmentDirection = 1; // -1 for backward
-float trebleHistory[TREBLE_HISTORY] = {0};
-int trebleIndex = 0;
-float trebleThreshold = 0; 
-float lastSmoothBand1 = 0;
-float threshold1 = 0;
-float smoothBands[7];
-CRGB leds1[NUM_LEDS];
-CRGB leds2[NUM_LEDS];
-uint8_t colorScheme1 = 0;
-uint8_t colorScheme2 = 1;
+  // graph area (leave 10px for text at bottom)
+  const int graphH = height - 12;
+  const int graphW = width;
+  const int colW   = graphW / 7;
+  const int gap    = 2;
 
+  display.clearDisplay();
 
+  // Title
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.print("MSGEQ7  (0..900)");
 
-DEFINE_GRADIENT_PALETTE(indigoPurpleBluePalette) {
-  0, 75, 0, 130,
-  64, 138, 43, 226,
-  128, 0, 0, 255,
-  192, 255, 0, 255,
-  255, 75, 0, 130
-};
-// NEW: Teal / Blue / Green / Pink replacement for RedGold
-DEFINE_GRADIENT_PALETTE(tealBlueGreenPinkPalette) {
-  0, 0, 255, 150,     // Teal
-  64, 0, 200, 255,    // Light blue
-  128, 0, 255, 0,     // Greenish
-  192, 255, 0, 150,   // Pinkish highlight
-  255, 0, 255, 255    // Soft lavender
-};
+  // Bars
+  for (int i = 0; i < 7; i++) {
+    int x = left + i * colW + gap/2;
+    int w = colW - gap;
+    w = max(w, 2);
 
-// Slightly tuned Green / Indigo / Orange
-DEFINE_GRADIENT_PALETTE(greenIndigoOrangePalette) {
-  0,   0,   100,  50,     // Deep green-teal
-  64,  0,   180, 100,     // Rich turquoise
-  100, 50,  0,   150,     // Violet-indigo
-  128, 100, 0,   180,     // Deep indigo
-  160, 180, 30,  100,     // Sunset gold
-  192, 255, 100,  0,      // Warm orange
-  224, 255, 180,  0,      // Bright amber
-  255, 255, 140,  40      // Golden pop
-};
+    // Map 0..900 to 0..graphH-14
+    int h = map(v[i], 0, 900, 0, graphH - 4);
+    int y = top + graphH - h;
 
+    // frame
+    display.drawRect(x, top + 10, w, graphH - 10, SSD1306_WHITE);
 
-DEFINE_GRADIENT_PALETTE(intenseRedPaletteWithIndigo) {
-  0, 255, 0, 0,       // Pure red
-  64,  255, 16, 16,     // Hot red
-  96,  200, 0, 0,       // Deep crimson
-  112, 255, 120, 0,     // 🔥 Gold-orange
-  128, 255, 200, 0,     // ✨ Bright gold
-  144, 255, 120, 0,     // 🔥 Gold-orange
-  160, 128, 0, 0,       // Darker red
-  192, 75,  0, 130,     // Indigo
-  224, 60,  0, 100,     // Deeper indigo
-  255, 30,  0, 60       // Fading indigo
-};
+    // fill
+    if (h > 0) {
+      display.fillRect(x+1, y, w-2, h, SSD1306_WHITE);
+    }
 
+    // tiny label value under each column
+    display.setCursor(x, height - 10);
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%d", v[i]);
+    display.print(buf);
+  }
 
+  display.display();
+}
 
-CRGB deepRedPalette[] = {
-  CRGB(90, 0, 0),
-  CRGB(120, 0, 0),
-  CRGB(200, 0, 0),
-  CRGB(255, 30, 30)
-};
-
-CRGBPalette16 sharedPalette = indigoPurpleBluePalette;
-CRGBPalette16 targetSharedPalette = indigoPurpleBluePalette;
-CRGBPalette16 treblePalette = intenseRedPaletteWithIndigo;
-CRGBPalette16 previousPalette = sharedPalette;
-unsigned long paletteBlendStart = 0;
-bool isBlending = false;
-
-
-// === Setup ===
 void setup() {
   Serial.begin(115200);
+  delay(200);
+
+  // I2C / OLED
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  if (!beginOLED()) {
+    Serial.println("SSD1306 init FAILED. Check wiring / address.");
+    while (true) delay(100);
+  }
+  drawBanner("Waiting for audio...");
+
+  // ADC config (ESP32)
+  analogReadResolution(12);
+  analogSetPinAttenuation(ANALOG_PIN, ADC_11db); // up to ~3.3–3.6V
+
+  // MSGEQ7 pins
   pinMode(STROBE_PIN, OUTPUT);
-  pinMode(RESET_PIN, OUTPUT);
+  pinMode(RESET_PIN,  OUTPUT);
   pinMode(ANALOG_PIN, INPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
+  digitalWrite(STROBE_PIN, HIGH);
+  digitalWrite(RESET_PIN,  LOW);
 
-  FastLED.addLeds<CHIPSET, DATA_PIN_1, COLOR_ORDER>(leds1, NUM_LEDS);
-  FastLED.addLeds<CHIPSET, DATA_PIN_2, COLOR_ORDER>(leds2, NUM_LEDS);
-  FastLED.setBrightness(BRIGHTNESS);
-
-  digitalWrite(RESET_PIN, LOW);
-  digitalWrite(STROBE_PIN, LOW);
-  delay(1);
-  digitalWrite(RESET_PIN, HIGH);
-  for (int i = 0; i < 7; i++) smoothBands[i] = 0;
-  initializeScreen();
-
-  xTaskCreatePinnedToCore(
-  displayTask,           // Task function
-  "Display Task",        // Task name
-  4096,                  // Stack size
-  NULL,                  // Task parameters
-  1,                     // Priority (low)
-  &displayTaskHandle,    // Task handle
-  0                      // Run on Core 0
-);
-
+  delay(200);
 }
 
-
-// === Main Loop ===
 void loop() {
+  int bands[7];
+  readMSGEQ7_900(bands);
 
-  readMSGEQ7();
-  updateDynamicMaxBand();
-  updateDynamicMaxTreble();
-  printBandsForPlotter();
-  updatePaletteBlend();
-  updateBassBrightnessOverlay();
-  //updateDisplay();
-  //handleButton();
-  //handlePotentiometer();
-
-
-  unsigned long now = millis();  // <== ONLY declare this once here
-  static unsigned long lastPaletteBlendTime = 0;
-  
-  static unsigned long lastCycle = 0;
-  if (now - lastCycle > 10000) {  // every 30 seconds
-  cyclePalettes();
-  lastCycle = now;
-}
-  
-
-// === Time-based palette blending ===
-if (isBlending) {
-  unsigned long elapsed = now - paletteBlendStart;
-
-  if (elapsed >= paletteCycleDuration) {
-    sharedPalette = targetSharedPalette;
-    isBlending = false;
-  } else {
-    uint8_t blendAmount = map(elapsed, 0, paletteCycleDuration, 0, 255);
-  }
-}
-
-  // Store previous smoothed value
-float currentSmoothBand1 = smoothBands[selectedBand1];
-
-// Compute bass delta trigger
-bool bassDeltaTrigger = (currentSmoothBand1 - lastSmoothBand1) > bassDeltaThreshold;
-
-if (bassDeltaTrigger) {
-    lastBassHit = now;
-}
-lastSmoothBand1 = currentSmoothBand1;
-
-   float bassValue = smoothBands[selectedBand1];
-  float trebleValue = smoothBands[selectedBand2];
-    static int bassLitLength = 0;
-
-
-  // Bass brightness mapping with baseBrightness fallback
-  uint8_t bassBrightness = baseBrightness;
-
-if (bassValue > threshold1) {
-  uint8_t newBrightness;
-
-  // Quantized brightness tiers
-  if (bassValue > maxBandValue * 0.65) {
-    newBrightness = maxBassBrightness; // full hit
-    bassLitLength = 14;
-  } else if (bassValue > maxBandValue * 0.4) {
-    newBrightness = maxBassBrightness * 0.85;
-    bassLitLength = 10;
-  } else if (bassValue > maxBandValue * 0.3) {
-    newBrightness = maxBassBrightness * 0.75;
-    bassLitLength = 8;
-  } else if (bassValue > maxBandValue * 0.2) {
-    newBrightness = maxBassBrightness * 0.60;
-    bassLitLength = 5;
-  } else {
-    newBrightness = maxBassBrightness * 0.5; // just fade-up slightly on weak hits
-    bassLitLength = 2;
-  }
-
-  newBrightness = constrain(newBrightness, baseBrightness, maxBassBrightness);
-
-  if (newBrightness > currentBassBrightness) {
-  currentBassBrightness = newBrightness;
-  targetBassBrightness = newBrightness;
-  bassFadeStart = now;
-
-  // Determine segment length based on intensity
-  //float intensity = (bassValue - threshold1) / (maxBandValue - threshold1);
-  //intensity = constrain(intensity, 0.0, 1.0);
-  //bassLitLength = map(intensity * 100, 0, 100, 2, 14);
-
-  // Move lit segment in current direction
-  bassLitStart += bassMoveDir * bassSegmentJump;
-
-  // Bounce at ends
-  if (bassLitStart <= 0) {
-    bassLitStart = 0;
-    bassMoveDir = 1;
-  } else if (bassLitStart + bassLitLength >= NUM_LEDS) {
-    bassLitStart = NUM_LEDS - bassLitLength;
-    bassMoveDir = -1;
-  }
-}
-}
-
-
-// Compute fade back to baseBrightness
-unsigned long fadeElapsed = now - bassFadeStart;
-if (fadeElapsed < bassFadeDuration) {
-  float fadeProgress = (float)fadeElapsed / bassFadeDuration;
-  currentBassBrightness = targetBassBrightness - (targetBassBrightness - baseBrightness) * fadeProgress;
-} else {
-  currentBassBrightness = baseBrightness;
-}
-
-//what the strip do
-
-bool showBassGlitter = (bassValue > threshold1);  // Only on valid hits
-float intensityRatio = constrain((bassValue - threshold1) / (maxBandValue - threshold1), 0.0, 1.0);
-
-
-// Sparkle chance and brightness scale with intensity
-uint8_t sparkleChance = map(intensityRatio * 100, 0, 100, 0, 20);
-uint8_t sparkleStrength = map(intensityRatio * 100, 0, 100, 60, 255);
-
-// Fade old sparkles
-for (int i = 0; i < NUM_LEDS; i++) {
-  bassSparkles[i].fadeToBlackBy(25);  // adjust for longer or shorter persistence
-}
-
-// Add new sparkles (intensity-scaled)
-if (showBassGlitter) {
-  for (int i = bassLitStart; i < bassLitStart + bassLitLength; i++) {
-    if (i >= 0 && i < NUM_LEDS && random8() < sparkleChance) {
-      bassSparkles[i] += CRGB::Red;  // or CRGB(sparkleStrength, 0, 0) for intensity scaling
-    }
-  }
-}
-
-
-  for (int i = 0; i < NUM_LEDS; i++) {
-  uint8_t index = map(i, 0, NUM_LEDS - 1, 0, 255);
-  uint8_t brightness = bassBrightnessOverlay[i];
-
-  // Base palette color using precomputed overlay
-  leds1[i] = ColorFromPalette(sharedPalette, index, brightness);
-
-  // Flicker: sparkle decay & red flash
-  if (sparkleFlicker[i] > 0) {
-    sparkleFlicker[i] = qsub8(sparkleFlicker[i], 6);  // decay flicker
-    uint8_t flickerIndex = map(sparkleFlicker[i], 0, 255, 0, 3);
-    leds1[i] += deepRedPalette[flickerIndex];
-  }
-
-  // Blend in red sparkles on top of palette
-  leds1[i] = blend(leds1[i], bassSparkles[i], 228);
-}
-
-
-if (showBassGlitter) {
-  for (int i = bassLitStart; i < bassLitStart + bassLitLength; i++) {
-    if (i >= 0 && i < NUM_LEDS && random8() < sparkleChance) {
-      sparkleFlicker[i] = random8(160, 255);
-    }
-  }
-}
-
-
-  // Base brightness on treble strip
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint8_t index = map(i, 0, NUM_LEDS - 1, 0, 255);
-    leds2[i] = ColorFromPalette(sharedPalette, index, (baseBrightness * 2));
-  }
-
-  // Treble burst trigger with back-and-forth movement
-  if (trebleValue > trebleThreshold && millis() - lastTrebleTrigger > trebleCooldown) {
-  lastTrebleTrigger = millis();
-
-  // Calculate intensity ratio
-  float trebleIntensity = (trebleValue - trebleThreshold) / (maxTrebleValue - trebleThreshold);
-  trebleIntensity = constrain(trebleIntensity, 0.0, 1.0);
-
-  // Determine brightness and segment size
-  uint8_t burstBrightness;
-  int burstSize;
-
-  if (trebleIntensity > 0.9) {
-    burstBrightness = maxTrebleBrightness;
-    burstSize = 6;
-  } else if (trebleIntensity > 0.75) {
-    burstBrightness = maxTrebleBrightness * 0.92;
-    burstSize = 5;
-  } else if (trebleIntensity > 0.6) {
-    burstBrightness = maxTrebleBrightness * 0.87;
-    burstSize = 4;
-  } else if (trebleIntensity > 0.4) {
-    burstBrightness = maxTrebleBrightness * 0.8;
-    burstSize = 3;
-  } else {
-    burstBrightness = maxTrebleBrightness * .65;
-    burstSize = 1;
-  }
-
-  // Bounce center position
-  int center = trebleBurstPos;
-  trebleBurstPos += trebleBurstDir * 2;
-
-  if (trebleBurstPos >= NUM_LEDS - 2 || trebleBurstPos <= 2) {
-    trebleBurstDir *= -1;
-    trebleBurstPos = constrain(trebleBurstPos, 2, NUM_LEDS - 3);
-  }
-
-  // Light up burst segment around center
-  for (int i = center - burstSize; i <= center + burstSize; i++) {
-    if (i >= 0 && i < NUM_LEDS) {
-      uint8_t index = map(i, 0, NUM_LEDS - 1, 0, 255);
-      trebleBursts[i] += ColorFromPalette(treblePalette, index, burstBrightness);
-    }
-  }
-}
-
-
-
-  for (int i = 0; i < NUM_LEDS; i++) {
-    trebleBursts[i].fadeToBlackBy(10);
-    leds2[i] = blend(leds2[i], trebleBursts[i], 150);
-  }
-
-  FastLED.show();
-  delay(5);
-}
-
-
-// Read MSGEQ7 values and smooth them
-void readMSGEQ7() {
-  digitalWrite(RESET_PIN, HIGH);
-  delayMicroseconds(1);
-  digitalWrite(RESET_PIN, LOW);
-
+  // smooth for a nicer display
   for (int i = 0; i < 7; i++) {
-    digitalWrite(STROBE_PIN, LOW);  
-    delayMicroseconds(60);  
-    
-    int rawValue = analogRead(ANALOG_PIN); // 0–4095
-    digitalWrite(STROBE_PIN, HIGH); 
-    delayMicroseconds(30);
-
-    int scaledValue = map(rawValue, 0, 4095, 0, 900);
-
-    const int MAX_REASONABLE_RAW = 700;
-    const int MAX_JUMP = 350;
-    float previous = smoothBands[i];
-
-    if (scaledValue > MAX_REASONABLE_RAW || abs(scaledValue - previous) > MAX_JUMP) {
-      scaledValue = previous;  // Discard unreasonable spike
-    }
-
-    // Exponential moving average
-    smoothBands[i] = scaledValue * 0.9 + previous * 0.1;
-
-    if (i == selectedBand2) {
-      trebleHistory[trebleIndex] = smoothBands[i];
-      trebleIndex = (trebleIndex + 1) % TREBLE_HISTORY;
-    }
-
-    if (smoothBands[i] < noiseFloor) {
-      smoothBands[i] = 0;
-    }
-  }
-}
-
-
-// Clean serial output for Python plotter
-void printBandsForPlotter() {
-  for (int i = 0; i < 7; i++) {
-    Serial.print(smoothBands[i], 2);
-    Serial.print(",");  // Always add a comma
-  }
-  Serial.print(threshold1, 2);         // Band 7
-  Serial.print(",");                  
-  Serial.println(trebleThreshold, 2);  // Band 8
-}
-
-// Cycle through predefined palettes
-void cyclePalettes() {
-  colorScheme1 = (colorScheme1 + 1) % 3;
-
-  switch (colorScheme1) {
-    case 0: targetSharedPalette = indigoPurpleBluePalette; break;
-    case 1: targetSharedPalette = tealBlueGreenPinkPalette; break;
-    case 2: targetSharedPalette = greenIndigoOrangePalette; break;
+    smooth900[i] = smooth900[i] + EMA * (bands[i] - smooth900[i]);
+    bands[i] = (int)(smooth900[i] + 0.5f);
   }
 
-  previousPalette = sharedPalette;   // Capture current palette before changing
-  paletteBlendStart = millis();      // Record time of transition
-  isBlending = true;                 // Flag to activate timed blending
-}
+  // draw to OLED
+  drawBands(bands);
 
-
-void updateDynamicMaxBand() {
-  static unsigned long lastBandUpdate = 0;
-  unsigned long now = millis();
-  float current = smoothBands[selectedBand1];
-
-  if (current > maxBandValue) {
-    maxBandValue = min(current, maxBandValue2);  // Optional clamp
-  }
-
-  if (now - lastBandUpdate > bassDecayMS) {
-    lastBandUpdate = now;
-    maxBandValue -= bassDecayRaw;  // Decay step
-    if (maxBandValue < 10) maxBandValue = 10;  // floor clamp
-  }
-
-  threshold1 = maxBandValue * bassThresholdFactor;  // Or whatever % works well
-}
-
-
-float computeAdaptiveTrebleThreshold(float* history, int length) {
-  float sorted[length];
-  memcpy(sorted, history, sizeof(float) * length);
-
-  // Simple bubble sort
-  for (int i = 0; i < length - 1; i++) {
-    for (int j = 0; j < length - i - 1; j++) {
-      if (sorted[j] > sorted[j + 1]) {
-        float temp = sorted[j];
-        sorted[j] = sorted[j + 1];
-        sorted[j + 1] = temp;
-      }
+  // optional serial
+  if (SERIAL_DEBUG) {
+    Serial.printf("Bands: ");
+    for (int i = 0; i < 7; i++) {
+      Serial.printf("%d%s", bands[i], (i<6?", ":"\n"));
     }
   }
 
-  int startIdx = length * 0.05;  // Skip bottom 5%
-  float sum = 0;
-  for (int i = startIdx; i < length; i++) {
-    sum += sorted[i];
-  }
-
-  return sum / (length - startIdx);
-}
-
-
-
-void updateDynamicMaxTreble() {
-  static unsigned long lastTrebleUpdate = 0;
-  unsigned long now = millis();
-  float currentTreble = smoothBands[selectedBand2];
-
-  // Update peak tracking
-  if (currentTreble > maxTrebleValue) {
-    maxTrebleValue = min(currentTreble, maxBandValue2);
-  }
-
-  // Decay over time
-  if (now - lastTrebleUpdate > trebleDecayMS) {
-    lastTrebleUpdate = now;
-    maxTrebleValue -= trebleDecayRaw;
-    maxTrebleValue = constrain(maxTrebleValue, 10, maxBandValue2);
-  }
-
-  // Compute smoothed trimmed average
-  float adaptiveAvg = computeAdaptiveTrebleThreshold(trebleHistory, TREBLE_HISTORY);
-
-  // Conservative floor: use average slightly boosted
-  float adaptiveFloor = adaptiveAvg * 1.05;  // smaller boost
-
-  // Peak-driven threshold for sharp responsiveness
-  float peakFloor = maxTrebleValue * trebleThresholdFactor;
-
-  // === Smooth blending instead of hard max ===
-  trebleThreshold = (adaptiveFloor * 0.6) + (peakFloor * 0.4);
-
-  // Optional: avoid overly low threshold on silence
-  if (trebleThreshold < 30) trebleThreshold = 30;
-}
-
-
-CRGBPalette16 blendedPalette;
-uint8_t paletteBlendAmount = 0;
-
-void updatePaletteBlend() {
-  if (isBlending) {
-    unsigned long elapsed = millis() - paletteBlendStart;
-
-    if (elapsed >= paletteCycleDuration) {
-      sharedPalette = targetSharedPalette;
-      isBlending = false;
-    } else {
-      paletteBlendAmount = map(elapsed, 0, paletteCycleDuration, 0, 255);
-      nblendPaletteTowardPalette(sharedPalette, targetSharedPalette, 8);  // gradual
-    }
-  }
-}
-
-void updateBassBrightnessOverlay() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    bassBrightnessOverlay[i] = baseBrightness;
-  }
-  for (int i = bassLitStart; i < bassLitStart + bassLitLength; i++) {
-    if (i >= 0 && i < NUM_LEDS) {
-      bassBrightnessOverlay[i] = currentBassBrightness;
-    }
-  }
-}
-
-void initializeScreen() {
-   if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_I2C_ADDR)) {
-    Serial.println(F("SSD1306 init failed"));
-    while (true);
-  }
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  // Startup screen
-  display.setCursor(0, 0);
-  display.println(F("MSGEQ7 Visualizer"));
-  display.println(F("Initializing..."));
-  display.display();
-  delay(1000);
-
-  // Draw static labels
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println(F("MSGEQ7 Visualizer"));
-  display.setCursor(0, 20);
-  display.println(F("Bass:"));
-  display.setCursor(0, 35);
-  display.println(F("Treble:"));
-  display.display();
-}
-
-void updateDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  display.setCursor(0, 0);
-  display.println("MSGEQ7 Visualizer");
-
-  display.setCursor(0, 20);
-  display.print("Bass ");
-  display.print(selectedBand1);
-  display.print(": ");
-  display.println((int)smoothBands[selectedBand1]);
-
-  display.setCursor(0, 35);
-  display.print("Treble ");
-  display.print(selectedBand2);
-  display.print(": ");
-  display.println((int)smoothBands[selectedBand2]);
-
-  display.setCursor(0, 50);
-  display.print(settingNames[currentSettingIndex]);
-  display.print(": ");
-  display.println(*tunableVars[currentSettingIndex]);
-
-  display.display();
-}
-
-void displayTask(void* parameter) {
-  while (true) {
-    updateDisplay();           // Update screen content
-    vTaskDelay(1000 / portTICK_PERIOD_MS); // Refresh every 1 second
-  }
-}
-
-
-
-void handleButton() {
-  int touchValue = touchRead(BUTTON_PIN);  // Lower = touch detected
-
-  static bool wasTouched = false;
-  static unsigned long lastChange = 0;
-
-  bool isTouched = (touchValue < touchThreshold);
-
-  if (isTouched && !wasTouched && millis() - lastChange > debounceDelay) {
-    lastChange = millis();
-    currentSettingIndex = (currentSettingIndex + 1) % NUM_SETTINGS;
-    Serial.print("Selected: ");
-    Serial.println(settingNames[currentSettingIndex]);
-  }
-
-  wasTouched = isTouched;
-}
-
-void handlePotentiometer() {
-  int raw = analogRead(POT_PIN);  // 0–4095 on ESP32
-  int mappedValue = map(raw, 0, 4095,
-                        settingMin[currentSettingIndex],
-                        settingMax[currentSettingIndex]);
-
-  static int lastValue = -1;
-  if (abs(mappedValue - lastValue) > 1) {
-    *(tunableVars[currentSettingIndex]) = mappedValue;
-    lastValue = mappedValue;
-
-    Serial.print(settingNames[currentSettingIndex]);
-    Serial.print(": ");
-    Serial.println(mappedValue);
-  }
+  delay(20); // ~50 FPS
 }
