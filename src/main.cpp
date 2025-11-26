@@ -3,6 +3,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Wire.h>
+#include <driver/rtc_io.h>
 
 // Forward declarations for types used in prototypes
 struct Cloud;
@@ -72,6 +73,8 @@ void setMusicPalette(uint8_t idx, uint16_t ms, bool instant);        // main imp
 #define CHIPSET    WS2812B
 #define COLOR_ORDER GRB
 #define BRIGHTNESS  160
+const uint8_t BRIGHT_MIN = 10;
+const uint8_t BRIGHT_MAX = 200;
 
 // Screen
 #define SCREEN_WIDTH 128
@@ -79,9 +82,6 @@ void setMusicPalette(uint8_t idx, uint16_t ms, bool instant);        // main imp
 #define SCREEN_ADDR 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-
-// Bank/control helpers (if you want prototypes up top as well)
-int  readPotFiltered(uint8_t pin, int &lastRaw, int dead);
 
 // ---- at the top ----
 constexpr bool BTN_ACTIVE_LOW = true;   // set false if using pulldown / to 3V3
@@ -187,7 +187,6 @@ const float   CLOUD_BREATHE = 0.1f; // 0..~0.3: how much clouds expand/contract
 
 static Cloud clouds1[CLOUD_COUNT];
 static Cloud clouds2[CLOUD_COUNT];
-static uint32_t cloudsLastUs = 0;
 
 // --- Auto palette cycling (Music mode) ---
 bool     autoCyclePal      = false;
@@ -207,28 +206,6 @@ enum SettingsItem : uint8_t {
   SI_COUNT
 };
 
-
-// ---- Arrow control modes (what Up/Down adjust) ----
-enum ArrowMode : uint8_t {
-  ARROW_STROBE_COLOR = 0,
-  ARROW_FLASH_COLOR,
-  ARROW_MUSIC_GATE,
-  ARROW_BASS_GATE,
-  ARROW_TREBLE_GATE,
-  ARROW_LASER_GATE,
-  ARROW_BRIGHTNESS,
-  ARROW_MODE_COUNT
-};
-const char* ARROW_MODE_NAMES[] = {
-  "StrobeColor", "FlashColor", "MusicGate", "BassGate", "TrebleGate", "LaserGate", "Brightness"
-};
-uint8_t arrowMode = ARROW_MUSIC_GATE;
-
-// Steps/limits for arrow adjustments
-const int     ARROW_STEP_THRESH   = 10;   // per keypress for thresholds
-const uint8_t ARROW_STEP_BRIGHT   = 5;    // per keypress for brightness
-const uint8_t BRIGHT_MIN          = 10;
-const uint8_t BRIGHT_MAX          = 200;
 
 // Defaults to restore with 'o'
 const uint8_t DEFAULT_BRIGHTNESS  = BRIGHTNESS; // from your #define (160)
@@ -486,11 +463,6 @@ const StrobeSet STROBE_SETS[] = {
 };
 const uint8_t STROBE_SET_COUNT = sizeof(STROBE_SETS)/sizeof(STROBE_SETS[0]);
 uint8_t strobeSetIdx = 0;  // <-- default strobe set on boot
-
-
-// Arrow-key parser: ESC [ A/B
-enum EscState { ESC_IDLE, ESC_SEEN, ESC_BRACKET };
-static EscState escState = ESC_IDLE;
 
 
 // ==== MUSIC PALETTES (1..9) ====
@@ -807,7 +779,6 @@ auto initClouds = [](Cloud* C, float baseSpeed){
 };
 initClouds(clouds1, CLOUD_SPEED_1);
 initClouds(clouds2, CLOUD_SPEED_2);
-cloudsLastUs = micros();
 
   pinMode(STROBE_PIN, OUTPUT);
   pinMode(RESET_PIN, OUTPUT);
@@ -1712,95 +1683,6 @@ void handleInputs() {
   while (Serial.available() > 0) {
     char c = Serial.read();
 
-    // ===== Arrow-key state machine (ESC [ A/B/C/D) =====
-    if (escState == ESC_IDLE) {
-      if ((uint8_t)c == 0x1B) {  // ESC
-        escState = ESC_SEEN;
-        continue;
-      }
-    } else if (escState == ESC_SEEN) {
-      if (c == '[') { escState = ESC_BRACKET; continue; }
-      else { escState = ESC_IDLE; /* fall through */ }
-    } else if (escState == ESC_BRACKET) {
-      if (c == 'A' || c == 'B' || c == 'C' || c == 'D') {
-        // Right/Left switch target among the arrow modes (now includes FlashColor & Brightness)
-if (c == 'C' || c == 'D') {
-  const uint8_t FIRST = ARROW_STROBE_COLOR;     
-  const uint8_t LAST  = ARROW_MODE_COUNT - 1; // ARROW_BRIGHTNESS
-  if (c == 'C') { // Right
-    arrowMode = (arrowMode >= LAST) ? FIRST : (arrowMode + 1);
-  } else {        // Left
-    arrowMode = (arrowMode <= FIRST) ? LAST : (arrowMode - 1);
-  }
-  Serial.print("Arrows -> ");
-  Serial.println(ARROW_MODE_NAMES[arrowMode]);
-  drawHome();
-  escState = ESC_IDLE;
-  continue;
-}
-
-
-        // Up/Down adjust the current gate
-        bool up = (c == 'A');
-        switch (arrowMode) {
-          case ARROW_MUSIC_GATE:
-            MUSIC_GATE_THRESH  = constrain(MUSIC_GATE_THRESH  + (up ? +ARROW_STEP_THRESH : -ARROW_STEP_THRESH), 0, 900);
-            Serial.printf("MusicGate=%d\n",  MUSIC_GATE_THRESH);
-            break;
-          case ARROW_BASS_GATE:
-            BASS_GATE_THRESH   = constrain(BASS_GATE_THRESH   + (up ? +ARROW_STEP_THRESH : -ARROW_STEP_THRESH),  0, 900);
-            Serial.printf("BassGate=%d\n",   BASS_GATE_THRESH);
-            break;
-          case ARROW_TREBLE_GATE:
-            TREBLE_GATE_THRESH = constrain(TREBLE_GATE_THRESH + (up ? +ARROW_STEP_THRESH : -ARROW_STEP_THRESH), 0, 900);
-            Serial.printf("TrebleGate=%d\n", TREBLE_GATE_THRESH);
-            break;
-          case ARROW_LASER_GATE:   // <-- NEW
-            LASER_GATE_THRESH  = constrain(LASER_GATE_THRESH  + (up ? +ARROW_STEP_THRESH : -ARROW_STEP_THRESH), 0, 900);
-            Serial.printf("LaserGate=%d\n",  LASER_GATE_THRESH);
-            break;
-          case ARROW_FLASH_COLOR: {
-          // Up = previous set, Down = next set (wrap)
-          int next = (int)flashSetIdx + (up ? -1 : +1);
-          if (next < 0) next = FLASH_SET_COUNT - 1;
-          if (next >= FLASH_SET_COUNT) next = 0;
-          flashSetIdx = (uint8_t)next;
-          Serial.printf("FlashColor -> %s (idx=%u)\n", FLASH_SETS[flashSetIdx].name, flashSetIdx);
-          break;
-              }
-          case ARROW_BRIGHTNESS: {
-          // Up/Down nudge global brightness
-          uint8_t cur = FastLED.getBrightness();
-          int v = (int)cur + (up ? +ARROW_STEP_BRIGHT : -ARROW_STEP_BRIGHT);
-          v = constrain(v, BRIGHT_MIN, BRIGHT_MAX);
-          FastLED.setBrightness((uint8_t)v);
-          Serial.printf("Brightness=%d\n", v);
-          break;
-              }
-          case ARROW_STROBE_COLOR: {
-         // Up = previous set, Down = next set (wrap)
-          int next = (int)strobeSetIdx + (up ? -1 : +1);
-          if (next < 0) next = STROBE_SET_COUNT - 1;
-          if (next >= STROBE_SET_COUNT) next = 0;
-          strobeSetIdx = (uint8_t)next;
-          Serial.printf("StrobeColor -> %s (idx=%u)\n", STROBE_SETS[strobeSetIdx].name, strobeSetIdx);
-          break;
-          }
-
-          default:
-            // ignore other modes while pots/buttons are disabled
-            break;
-        }
-        drawHome();
-        escState = ESC_IDLE;
-        continue;
-      } else {
-        escState = ESC_IDLE; // abort sequence
-      }
-    }
-
-    // ================================================
-
     // ---- Auto palette cycle toggle (Music mode) ----
     if (c == 'a' || c == 'A') {
       if (currentMode != MUSIC_MODE) currentMode = MUSIC_MODE;
@@ -1912,18 +1794,6 @@ if (c == 'C' || c == 'D') {
 
 
 
-    // ---- Rotate arrow target: 'p' (cycle Music → Bass → Treble → Laser) ----
-if (c == 'p' || c == 'P') {
-  if      (arrowMode == ARROW_MUSIC_GATE)   arrowMode = ARROW_BASS_GATE;
-  else if (arrowMode == ARROW_BASS_GATE)    arrowMode = ARROW_TREBLE_GATE;
-  else if (arrowMode == ARROW_TREBLE_GATE)  arrowMode = ARROW_LASER_GATE;   // <-- NEW hop
-  else                                      arrowMode = ARROW_MUSIC_GATE;   // wrap to start
-  Serial.print("Arrows -> ");
-  Serial.println(ARROW_MODE_NAMES[arrowMode]);
-  drawHome();
-  continue;
-}
-
     // ---- Restore defaults: 'o' ----
     if (c == 'o' || c == 'O') {
       flashSetIdx        = DEFAULT_FLASHSET;
@@ -2020,9 +1890,20 @@ uint16_t POP_FLASH_MS_K = POP_FLASH_MS, POP_HOLD_MS_K = POP_HOLD_MS, POP_FADE_MS
 static void initButtons() {
   const uint8_t pins[8] = {BTN_A,BTN_B,BTN_C,BTN_D,BTN_E,BTN_F,BTN_G,BTN_H};
   for (int i=0;i<8;i++){
-    bool hasPullup = !(pins[i]==34 || pins[i]==35 || pins[i]==36 || pins[i]==39);
-    pinMode(pins[i], hasPullup ? INPUT_PULLUP : INPUT);
-    BTN[i].pin = pins[i];
+    const uint8_t pin = pins[i];
+    const bool inputOnly = (pin == 34 || pin == 35 || pin == 36 || pin == 39);
+
+    // GPIO 34/35/36/39 lack the regular INPUT_PULLUP path; enable the RTC pull-up
+    // so Up/Enter/Down remain stable instead of floating.
+    if (inputOnly) {
+      pinMode(pin, INPUT);
+      rtc_gpio_pullup_en((gpio_num_t)pin);
+      rtc_gpio_pulldown_dis((gpio_num_t)pin);
+    } else {
+      pinMode(pin, INPUT_PULLUP);
+    }
+
+    BTN[i].pin = pin;
     BTN[i].lastLevel = btnIdleLevel();
     BTN[i].lastChangeMs = 0;
     BTN[i].pressed = false;
@@ -2051,15 +1932,6 @@ static void scanButtons() {
       }
     }
   }
-}
-
-
-int readPotFiltered(uint8_t pin, int &lastRaw, int dead) {
-  int raw = analogRead(pin);
-  if (lastRaw < 0) { lastRaw = raw; return raw; }
-  if (abs(raw - lastRaw) < dead) return lastRaw;
-  lastRaw = raw;
-  return raw;
 }
 
 
