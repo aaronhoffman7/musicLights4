@@ -11,16 +11,12 @@ struct StaticPulse;  // optional (you already use 'struct StaticPulse*' in a pro
 struct EffectEntry { const char* name; void (*fn)(); }; // if not already visible here
 // --- fwd used by makeMusicFrame & MUSIC_EFFECTS ---
 uint8_t sens(uint8_t n);          // defined later (inline uses GATE_SENS_Q8)
-extern uint8_t bandNorm[7];       // from MSGEQ7 section
-extern uint8_t audioPeakN;        // from MSGEQ7 section
-
 
 // ==== New function prototypes ====
 void fx_segmentDJ();
 void renderPaletteClouds(CRGB* led, bool reverseIndex,
                          const CRGBPalette16& pal, uint8_t baseV, Cloud* C,
                          uint16_t t1, uint16_t t2, uint16_t t3);
-void addRippleOverlay();
 void spawnRipple(int center, bool isBass);
 void spawnStaticPulse(bool onStrip1, int headIdx, bool dirRight);
 void renderStaticPulses(struct StaticPulse* arr, CRGB* strip);
@@ -35,6 +31,8 @@ void fx_paletteFlow();
 void addSegmentOverlay();
 void spawnSegmentStrong(int start, int len, bool isBass, uint8_t vMax);
 void dumpIOOnce();
+static void drawFxTweakScreen();
+
 // ---- Palette blend control (defaults & prototypes) ----
 constexpr uint16_t PALETTE_BLEND_MS_DEFAULT = 1;   // fast manual fade
 
@@ -78,10 +76,6 @@ void setMusicPalette(uint8_t idx, uint16_t ms, bool instant);        // main imp
 #define SCREEN_HEIGHT 64
 #define SCREEN_ADDR 0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-
-// Bank/control helpers (if you want prototypes up top as well)
-int  readPotFiltered(uint8_t pin, int &lastRaw, int dead);
 
 // ---- at the top ----
 constexpr bool BTN_ACTIVE_LOW = true;   // set false if using pulldown / to 3V3
@@ -376,13 +370,6 @@ const int TREBLE_STEP   = 19;   // advance per 'C' tap
 const int BASS_SEG_LEN  = 40;   // segment length for bass burst
 const int TREB_SEG_LEN  = 26;   // segment length for treble burst
 
-
-struct Ripple {
-  int center;
-  unsigned long startMs;
-  bool bass; // true = N, false = C
-  bool active;
-};
 struct Segment {
   int start;
   int length;
@@ -393,15 +380,8 @@ struct Segment {
 };
 
 
-static const uint8_t MAX_RIPPLES  = 10;
 static const uint8_t MAX_SEGMENTS = 8;
-static Ripple  ripples[MAX_RIPPLES];
 static Segment segments[MAX_SEGMENTS];
-
-// Ripple dynamics
-const float RIPPLE_SPEED_PX_PER_MS = 0.18f; // radius grows per ms
-const uint16_t RIPPLE_FADE_MS      = 900;   // lifespan
-const uint8_t RIPPLE_WIDTH         = 10;    // ring thickness (px)
 
 // --- Dark (Music) → Party segment-pop engine ---
 const uint8_t DARK_PALETTE_INDEX = 5;      // your "Dark" entry in musicPalettes[]
@@ -776,10 +756,6 @@ analogReadResolution(12);                      // ESP32 ADC 0..4095
 analogSetPinAttenuation(ANALOG_PIN, ADC_11db); // up to ~3.6V on ADC1 pins
 analogSetPinAttenuation(POT1_PIN, ADC_11db);
 analogSetPinAttenuation(POT2_PIN, ADC_11db);  // GPIO 15 is ADC2; fine if WiFi is off
-
-  display.clearDisplay();
-  display.display();
-  drawHome();
   
     initNewUI();
 
@@ -1353,11 +1329,7 @@ if (LASER_AUTO_ENABLED) {
       lastLaserTrigger  = now;
     }
   }
-} else {
-  // If auto is off, ensure we don't keep residual strobe
-  // (manual laserOn still works via button A / 'l')
 }
-
 
   // ============== DARK palette =========
   if (musicPaletteIndex == DARK_PALETTE_INDEX) {
@@ -1450,52 +1422,6 @@ renderPaletteClouds(leds2, true,  currentPal, bright, clouds2, T1b, T2b, T3b);
   addSegmentOverlay();
 }
 
-
-void addRippleOverlay() {
-  advanceFlicker(); // still use flicker to add motion to the mix amount
-
-  unsigned long now = millis();
-  for (uint8_t k = 0; k < MAX_RIPPLES; k++) {
-    if (!ripples[k].active) continue;
-    uint32_t age = now - ripples[k].startMs;
-    if (age > RIPPLE_FADE_MS) { ripples[k].active = false; continue; }
-
-    float radius = age * RIPPLE_SPEED_PX_PER_MS;
-    uint8_t life = 255 - map(age, 0, RIPPLE_FADE_MS, 0, 255);
-
-    // pick accent per palette + type
-    const CRGB accent = ripples[k].bass ? ACCENT[musicPaletteIndex].bass
-                                    : ACCENT[musicPaletteIndex].treble;
-
-
-
-    // slight hue bias keeps ripples distinct for bass/treble
-    uint8_t bias = ripples[k].bass ? 0 : 96;
-
-    for (int i = 0; i < NUM_LEDS; i++) {
-      int d = (int)wrapDistF((float)i, (float)ripples[k].center, (float)NUM_LEDS);
-      int band = abs(d - (int)radius);
-      if (band <= RIPPLE_WIDTH) {
-        // ring brightness with sharper center
-        uint8_t ringV = scale8(255 - (band * (255 / (RIPPLE_WIDTH + 1))), life);
-
-        // palette index wiggle
-        uint8_t palIdx = ((i * 3) + (age >> 2) + bias + (flickerSeed & 0x1F)) & 0xFF;
-
-        // base from currentPal
-        CRGB base = ColorFromPalette(currentPal, palIdx, ringV);
-
-        // jittered blend amount (ripples = lighter blend than segments)
-        uint8_t mixAmt = 96 + ((i * 13 + flickerSeed * 71 + (age >> 3)) & 0x3F); // ~96..159
-
-        CRGB c = blendToward(base, accent, mixAmt);
-
-        mixOverlay(leds1[i], c, 224);
-        mixOverlay(leds2[NUM_LEDS - 1 - i], c, 224);
-      }
-    }
-  }
-}
 
 void addSegmentOverlay() {
   // No flicker needed; pops are deterministic and punchy
@@ -1604,29 +1530,6 @@ auto applyEnvelope = [&](CRGB c)->CRGB {
 }
 
 
-
-
-// Replace your spawnRipple / spawnSegment with these:
-
-void spawnRipple(int center, bool isBass) {
-  // try free slot first
-  for (uint8_t k = 0; k < MAX_RIPPLES; k++) {
-    if (!ripples[k].active) {
-      ripples[k] = { center, millis(), isBass, true };
-      return;
-    }
-  }
-  // overwrite the OLDEST
-  uint8_t oldest = 0;
-  unsigned long oldestAge = 0;
-  unsigned long now = millis();
-  for (uint8_t k = 0; k < MAX_RIPPLES; k++) {
-    unsigned long age = now - ripples[k].startMs;
-    if (age > oldestAge) { oldestAge = age; oldest = k; }
-  }
-  ripples[oldest] = { center, now, isBass, true };
-}
-
 void spawnSegment(int start, int len, bool isBass) {
   int normStart = (start % NUM_LEDS + NUM_LEDS) % NUM_LEDS;
 
@@ -1676,7 +1579,6 @@ void fx_segmentDJ() {
   renderPaletteClouds(leds2, /*reverseIndex=*/true,  currentPal, baseV, clouds2, u1, u2, u3);
 
   addSegmentOverlay();
-  addRippleOverlay();
 }
 
 
@@ -2004,9 +1906,6 @@ void renderStaticPulses(StaticPulse* arr, CRGB* strip) {
   }
 }
 
-// --- A: Palettes/Flash ---
-int blendMsDefault = 250;
-
 // These three are “virtual” knobs that scale existing behaviors:
 uint8_t CLOUD_EDGE_SOFT_KNOB = 50;      // maps to CLOUD_EDGE/softness factor
 uint8_t CLOUD_SPEED_SCALE    = 100;     // 100% = unchanged
@@ -2054,14 +1953,6 @@ static void scanButtons() {
 }
 
 
-int readPotFiltered(uint8_t pin, int &lastRaw, int dead) {
-  int raw = analogRead(pin);
-  if (lastRaw < 0) { lastRaw = raw; return raw; }
-  if (abs(raw - lastRaw) < dead) return lastRaw;
-  lastRaw = raw;
-  return raw;
-}
-
 
 // ==== QUICK I/O MONITOR (press 'Z') ====
 void dumpIOOnce() {
@@ -2076,6 +1967,7 @@ void dumpIOOnce() {
 
 
 void drawHome() {
+  if (!displayOK) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -2119,11 +2011,11 @@ display.println(potMode == PM_BRIGHT_MUSIC ? "Bright+Music" : "Bass+Treble");
 }
 
 static void drawSettingsRoot() {
+  if (!displayOK) return;
 const char* items[SI_COUNT] = {
   "Music", "Palette Color", "Flash Color", "Knob Mode",
   "Laser Auto", "Laser Gate"
 };
-
 
 display.clearDisplay();
 display.setTextSize(1);
@@ -2148,7 +2040,6 @@ for (uint8_t i=0;i<SI_COUNT;i++){
 }
 
 
-
 display.setCursor(0,56);
 display.print("E/G:Up/Down  F:Enter  H:Back");
 display.display();
@@ -2156,6 +2047,7 @@ display.display();
 
 
 static void drawSettingsMusic() {
+  if (!displayOK) return;
   const char* items[4] = { "Music Gate", "Bass Gate", "Treble Gate", "Sensitivity%" };
   int valsInt[3] = {MUSIC_GATE_THRESH, BASS_GATE_THRESH, TREBLE_GATE_THRESH};
 
@@ -2187,6 +2079,7 @@ static void drawSettingsMusic() {
 
 
 static void drawParamAdjust(const char* name, const char* hint, const char* valueText) {
+  if (!displayOK) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -2416,7 +2309,13 @@ static void tickSettingsMusic() {
 
 static void tickHome() {
   // H single press → Settings
-  if (BTN[BI_H].fellEdge) { ui = UI_SETTINGS; menuCursor=0; uiLastActivityMs=millis(); drawSettingsRoot(); return; }
+  if (BTN[BI_H].fellEdge) {
+    ui = UI_SETTINGS;
+    menuCursor = 0;
+    uiLastActivityMs = millis();
+    drawSettingsRoot();
+    return;
+  }
 
   // H hold (>700ms) → panic back to Music mode
   static uint32_t hPressStart = 0;
@@ -2427,62 +2326,86 @@ static void tickHome() {
     drawHome();
   }
 
-  // --- NEW: On Home, E/G cycle palette ---
+  // --- On Home, E/G cycle palette ---
   if (BTN[BI_E].fellEdge || BTN[BI_G].fellEdge) {
-    int delta = BTN[BI_E].fellEdge ? -1 : +1;                 // E = Up/prev, G = Down/next
+    int delta = BTN[BI_E].fellEdge ? -1 : +1;  // E = Up/prev, G = Down/next
     int next  = (int)musicPaletteIndex + delta;
     if (next < 0) next = MUSIC_PALETTE_COUNT - 1;
     if (next >= MUSIC_PALETTE_COUNT) next = 0;
-    setMusicPalette((uint8_t)next);                           // smooth blend
+    setMusicPalette((uint8_t)next);           // smooth blend
     uiLastActivityMs = millis();
-    drawHome();                                               // refresh HUD
+    drawHome();                               // refresh HUD
     return;
   }
 
   // FX selects (B/C/D)
-  if (BTN[BI_B].fellEdge) { currentMode = FX_MODE; currentEffect = FX_CONFETTI;  drawHome(); drawHome(); uiLastActivityMs=millis(); }
-  if (BTN[BI_C].fellEdge) { currentMode = FX_MODE; currentEffect = FX_BOUNCE;    drawHome(); drawHome(); uiLastActivityMs=millis(); }
-  if (BTN[BI_D].fellEdge) { currentMode = FX_MODE; currentEffect = FX_SEGMENT_DJ;drawHome(); drawHome(); uiLastActivityMs=millis(); }
+  if (BTN[BI_B].fellEdge) {
+    currentMode = FX_MODE;
+    currentEffect = FX_CONFETTI;
+    uiLastActivityMs = millis();
+    drawHome();
+  }
+  if (BTN[BI_C].fellEdge) {
+    currentMode = FX_MODE;
+    currentEffect = FX_BOUNCE;
+    uiLastActivityMs = millis();
+    drawHome();
+  }
+  if (BTN[BI_D].fellEdge) {
+    currentMode = FX_MODE;
+    currentEffect = FX_SEGMENT_DJ;
+    uiLastActivityMs = millis();
+    drawHome();
+  }
 
   // F enters FX tweak when in FX mode
   if (BTN[BI_F].fellEdge && currentMode == FX_MODE) {
     ui = UI_FX_TWEAK;
     uiLastActivityMs = millis();
-    potPickupRaw = -1; potPickup = true;
-    display.clearDisplay();
-    display.setTextSize(1); display.setTextColor(SSD1306_WHITE); display.setCursor(0,0);
-    display.println("FX Tweak");
-    display.print("Effect: "); display.println(FX[currentEffect].name);
-    if (currentEffect == FX_BOUNCE)
-      display.println("Pot: Length  (F toggles Speed)");
-    else if (currentEffect == FX_CONFETTI)
-      display.println("Pot: Brightness");
-    display.println("H:Back");
-    display.display();
+    potPickupRaw = -1;
+    potPickup    = true;
+    drawFxTweakScreen();
+    return;
   }
 }
+
 
 static void tickFxTweak() {
   // Back to Home
   if (BTN[BI_H].fellEdge) { goHome(); return; }
 
-  // Bounce: F cycles pot target (Length <-> Speed)
-  if (currentEffect == FX_BOUNCE && BTN[BI_F].fellEdge) {
-    bouncePotTargetsLen = !bouncePotTargetsLen;
-    uiLastActivityMs = millis();
-
-    // refresh HUD
-    display.clearDisplay();
-    display.setTextSize(1); display.setTextColor(SSD1306_WHITE); display.setCursor(0,0);
-    display.println("FX Tweak");
-    display.print("Effect: "); display.println(FX[currentEffect].name);
-    display.print("Pot: "); display.println(bouncePotTargetsLen ? "Length" : "Speed");
-    display.println("H:Back");
-    display.display();
-
-    Serial.printf("Bounce pot -> %s\n", bouncePotTargetsLen ? "Length" : "Speed");
-  }
+if (currentEffect == FX_BOUNCE && BTN[BI_F].fellEdge) {
+  bouncePotTargetsLen = !bouncePotTargetsLen;
+  uiLastActivityMs = millis();
+  drawFxTweakScreen();
+  Serial.printf("Bounce pot -> %s\n", bouncePotTargetsLen ? "Length" : "Speed");
 }
+
+  }
+
+
+static void drawFxTweakScreen() {
+  if (!displayOK) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("FX Tweak");
+  display.print("Effect: ");
+  display.println(FX[currentEffect].name);
+
+  if (currentEffect == FX_BOUNCE) {
+    display.print("Pot: ");
+    display.println(bouncePotTargetsLen ? "Length" : "Speed");
+  } else if (currentEffect == FX_CONFETTI) {
+    display.println("Pot: Brightness");
+  }
+
+  display.println("H:Back");
+  display.display();
+}
+
 
 
 // CALL THIS ONCE in setup()
