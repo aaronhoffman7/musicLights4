@@ -3,6 +3,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Wire.h>
+#include <driver/rtc_io.h>
 
 // Forward declarations for types used in prototypes
 struct Cloud;
@@ -1889,9 +1890,20 @@ uint16_t POP_FLASH_MS_K = POP_FLASH_MS, POP_HOLD_MS_K = POP_HOLD_MS, POP_FADE_MS
 static void initButtons() {
   const uint8_t pins[8] = {BTN_A,BTN_B,BTN_C,BTN_D,BTN_E,BTN_F,BTN_G,BTN_H};
   for (int i=0;i<8;i++){
-    bool hasPullup = !(pins[i]==34 || pins[i]==35 || pins[i]==36 || pins[i]==39);
-    pinMode(pins[i], hasPullup ? INPUT_PULLUP : INPUT);
-    BTN[i].pin = pins[i];
+    const uint8_t pin = pins[i];
+    const bool inputOnly = (pin == 34 || pin == 35 || pin == 36 || pin == 39);
+
+    // GPIO 34/35/36/39 lack the regular INPUT_PULLUP path; enable the RTC pull-up
+    // so Up/Enter/Down remain stable instead of floating.
+    if (inputOnly) {
+      pinMode(pin, INPUT);
+      rtc_gpio_pullup_en((gpio_num_t)pin);
+      rtc_gpio_pulldown_dis((gpio_num_t)pin);
+    } else {
+      pinMode(pin, INPUT_PULLUP);
+    }
+
+    BTN[i].pin = pin;
     BTN[i].lastLevel = btnIdleLevel();
     BTN[i].lastChangeMs = 0;
     BTN[i].pressed = false;
